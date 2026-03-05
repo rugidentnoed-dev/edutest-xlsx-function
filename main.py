@@ -268,3 +268,227 @@ def _build_xlsx(title, school, academic_session, term, exam_type, downloaded_by,
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+
+# =============================================================================
+# ANSWER AUDIT ENDPOINT
+# =============================================================================
+# Per-student layout:
+#   Global header (school / session / term / type / title / warning)
+#   For each student:
+#     ├─ Name, email, class, exam, score banner
+#     └─ Table: Q# | Question Text | Option Picked | Correct Answer | Correct?
+# =============================================================================
+
+AUDIT_NCOLS = 5
+
+@functions_framework.http
+def generate_audit_xlsx(request: Request):
+    if request.method == 'OPTIONS':
+        return make_response('', 204, CORS)
+    if request.method != 'POST':
+        return ('Method not allowed', 405, CORS)
+
+    body             = request.get_json(force=True, silent=True) or {}
+    title            = str(body.get('title',            'Answer Audit'))[:120]
+    school           = str(body.get('school',           ''))[:120]
+    academic_session = str(body.get('academic_session', ''))[:80]
+    term             = str(body.get('term',             ''))[:60]
+    exam_type        = str(body.get('exam_type',        ''))[:60]
+    requested_by     = str(body.get('requested_by',     ''))[:120]
+    scope            = str(body.get('scope',            ''))[:120]
+    rows             = body.get('rows', [])
+
+    data     = _build_audit_xlsx(title, school, academic_session, term,
+                                  exam_type, requested_by, scope, rows)
+    safe     = ''.join(ch if ch.isalnum() or ch in ' _-' else '_' for ch in title)
+    filename = f"{safe}.xlsx"
+
+    resp = make_response(data)
+    resp.headers['Content-Type']        = (
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    resp.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+    for k, v in CORS.items():
+        resp.headers[k] = v
+    return resp
+
+
+def _build_audit_xlsx(title, school, academic_session, term, exam_type,
+                       requested_by, scope, rows):
+    # Colour scheme — amber to distinguish from normal results
+    AMBER        = 'B45309'
+    AMBER_LIGHT  = 'D97706'
+    AMBER_PALE   = 'FEF3C7'
+    AMBER_BG     = 'FFFBEB'
+    GREEN_OK     = '059669'
+    RED_NO       = 'DC2626'
+    GREY_NA      = '9CA3AF'
+    STUDENT_BG   = '166534'   # dark green for student banner
+
+    FILL_AMBER       = PatternFill('solid', fgColor=AMBER)
+    FILL_AMBER_LIGHT = PatternFill('solid', fgColor=AMBER_LIGHT)
+    FILL_AMBER_PALE  = PatternFill('solid', fgColor=AMBER_PALE)
+    FILL_AMBER_BG    = PatternFill('solid', fgColor=AMBER_BG)
+    FILL_WARN        = PatternFill('solid', fgColor='FEE2E2')
+    FILL_STUDENT     = PatternFill('solid', fgColor=STUDENT_BG)
+    FILL_META        = PatternFill('solid', fgColor='F0FDF4')
+    FILL_COL_HDR     = PatternFill('solid', fgColor='92400E')
+
+    NC = AUDIT_NCOLS
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Answer Audit'
+    row = 1
+
+    def cell_m(r, c1, c2, val, fill, fnt, aln=None):
+        if c1 < c2:
+            ws.merge_cells(start_row=r, start_column=c1, end_row=r, end_column=c2)
+        cel = ws.cell(row=r, column=c1, value=val)
+        cel.fill = fill; cel.font = fnt; cel.alignment = aln or _CENTER
+        return cel
+
+    # ── Global header ─────────────────────────────────────────────────────────
+    cell_m(row, 1, NC, school.upper() if school else 'ANSWER AUDIT',
+           FILL_AMBER, _font(13, True, _WHITE))
+    ws.row_dimensions[row].height = 30;  row += 1
+
+    # Session | Term | Type
+    cell_m(row, 1, 2,
+           f'Session: {academic_session}' if academic_session else 'Session: —',
+           FILL_AMBER_LIGHT, _font(9, True, _WHITE))
+    ws.cell(row=row, column=3, value=f'Term: {term}' if term else 'Term: —'
+            ).fill = FILL_AMBER_LIGHT
+    ws.cell(row=row, column=3).font = _font(9, True, _WHITE)
+    ws.cell(row=row, column=3).alignment = _CENTER
+    cell_m(row, 4, NC, f'Type: {exam_type}' if exam_type else 'Type: —',
+           FILL_AMBER_LIGHT, _font(9, True, _WHITE))
+    ws.row_dimensions[row].height = 18;  row += 1
+
+    # Report title
+    cell_m(row, 1, NC, title, FILL_AMBER_PALE, _font(11, True, AMBER))
+    ws.row_dimensions[row].height = 22;  row += 1
+
+    # Confidential warning
+    cell_m(row, 1, NC,
+           '⚠  CONFIDENTIAL — Authorised Investigation Use Only',
+           FILL_WARN, _font(9, True, RED_NO))
+    ws.row_dimensions[row].height = 16;  row += 1
+
+    # Scope / requested by
+    cell_m(row, 1, 2, f'Scope: {scope}' if scope else '',
+           FILL_AMBER_PALE, _font(9, False, AMBER))
+    cell_m(row, 3, NC, f'Requested by: {requested_by}',
+           FILL_AMBER_PALE, _font(9, False, AMBER))
+    ws.row_dimensions[row].height = 14;  row += 1
+
+    row += 1  # spacer
+
+    # ── Per-student sections ──────────────────────────────────────────────────
+    for stu in rows:
+        q_rows    = stu.get('q_rows', [])
+        pct       = int(stu.get('percentage', 0))
+        score     = stu.get('score', 0)
+        total_qs  = stu.get('total_qs', 0)
+        answered  = stu.get('answered', 0)
+        unanswered= stu.get('unanswered', 0)
+
+        # Student banner
+        cell_m(row, 1, NC,
+               f'{stu.get("name","—")}   ·   {stu.get("email","")}',
+               FILL_STUDENT, _font(10, True, _WHITE))
+        ws.row_dimensions[row].height = 20;  row += 1
+
+        # Student meta
+        meta = [
+            f'Class: {stu.get("class","—")}',
+            f'Exam: {stu.get("exam","—")}',
+            f'Score: {score}/{total_qs}  ({pct}%)',
+            f'Answered: {answered}  ·  Unanswered: {unanswered}',
+            f'Submitted: {stu.get("submitted","—")}',
+        ]
+        for col, val in enumerate(meta, 1):
+            cel = ws.cell(row=row, column=col, value=val)
+            cel.fill = FILL_META; cel.font = _font(9, False, _DARK); cel.alignment = _LEFT
+        ws.row_dimensions[row].height = 16;  row += 1
+
+        # Column headers
+        for col, hdr in enumerate(['Q#', 'Question Text', 'Option Picked', 'Correct Answer', 'Correct?'], 1):
+            cel = ws.cell(row=row, column=col, value=hdr)
+            cel.fill = FILL_COL_HDR; cel.font = _font(9, True, _WHITE); cel.alignment = _CENTER
+        ws.row_dimensions[row].height = 18;  row += 1
+
+        # Question rows
+        if not q_rows:
+            cell_m(row, 1, NC, '(no answer data recorded)', PatternFill(), _font(9, False, GREY_NA))
+            ws.row_dimensions[row].height = 16;  row += 1
+        else:
+            for qi, qr in enumerate(q_rows):
+                status   = qr.get('is_correct', 'NO')
+                is_yes   = status == 'YES'
+                is_na    = status == 'NOT ANSWERED'
+                alt_fill = FILL_AMBER_BG if qi % 2 == 0 else PatternFill()
+                picked_color  = GREEN_OK if is_yes else (GREY_NA if is_na else RED_NO)
+                status_color  = GREEN_OK if is_yes else (GREY_NA if is_na else RED_NO)
+
+                vals   = [qr.get('q_num', qi+1), qr.get('question','—'),
+                          qr.get('picked','(not answered)'), qr.get('correct','—'), status]
+                aligns = [_CENTER, _LEFT, _LEFT, _LEFT, _CENTER]
+                colors = [_GREY, _DARK, picked_color, GREEN_OK, status_color]
+                bolds  = [False,  False, True,         True,     True]
+
+                for col, (v, aln, clr, bld) in enumerate(zip(vals, aligns, colors, bolds), 1):
+                    cel = ws.cell(row=row, column=col, value=v)
+                    cel.border = _BORDER; cel.font = _font(9, bld, clr); cel.alignment = aln
+                    if qi % 2 == 0: cel.fill = alt_fill
+
+                # Wrap text on Question, Picked, Correct columns
+                for col in [2, 3, 4]:
+                    ws.cell(row=row, column=col).alignment = Alignment(
+                        horizontal='left', vertical='top', wrap_text=True)
+                ws.row_dimensions[row].height = 32;  row += 1
+
+        # Spacer between students
+        ws.row_dimensions[row].height = 6;  row += 1
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    for col, width in enumerate([4, 52, 32, 32, 12], 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    _lock_all(ws)
+
+    # ── Audit Trail sheet ─────────────────────────────────────────────────────
+    ws2 = wb.create_sheet('Audit Trail')
+    now = datetime.now(timezone.utc).strftime('%d %b %Y  %H:%M UTC')
+    trail = [
+        ('EduTest Pro — Answer Audit', ''),
+        ('', ''),
+        ('School',           school),
+        ('Academic Session', academic_session or '—'),
+        ('Term',             term             or '—'),
+        ('Exam Type',        exam_type        or '—'),
+        ('Report Title',     title),
+        ('Scope',            scope),
+        ('Requested By',     requested_by),
+        ('Generated On',     now),
+        ('Total Students',   len(rows)),
+        ('', ''),
+        ('Contents',
+         'Question text · Option the student selected · Correct answer · Whether correct.'),
+        ('Does NOT contain',
+         'All answer options are NOT listed — only what was picked and what was correct.'),
+        ('Intended use',     'Authorised investigation only. Protected by EduTest Pro.'),
+    ]
+    for r, (k, v) in enumerate(trail, 1):
+        ck = ws2.cell(row=r, column=1, value=k)
+        cv = ws2.cell(row=r, column=2, value=v)
+        ck.font = _font(10, True, _GREY); cv.font = _font(10, False, _DARK)
+        if r == 1:
+            ws2.merge_cells('A1:B1'); cv.value = ''
+            ck.font = _font(13, True, AMBER)
+    ws2.column_dimensions['A'].width = 20
+    ws2.column_dimensions['B'].width = 80
+    _lock_all(ws2)
+
+    buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
