@@ -1,4 +1,6 @@
 import io
+import os
+import json
 from datetime import datetime, timezone
 from openpyxl import Workbook
 from openpyxl.styles import Protection, Font, PatternFill, Alignment, Border, Side
@@ -6,11 +8,31 @@ from openpyxl.utils import get_column_letter
 import functions_framework
 from flask import Request, make_response
 
-PROTECT_PASSWORD = 'EduTestPro2025'
+# ── Firebase Admin SDK ────────────────────────────────────────────────────────
+import firebase_admin
+from firebase_admin import credentials, firestore as admin_firestore, auth as fb_auth
+
+_fdb = None
+
+def _get_db():
+    """Initialise Firebase Admin once, return Firestore client."""
+    global _fdb
+    if _fdb:
+        return _fdb
+    if not firebase_admin._apps:
+        sa_json = os.environ.get('SERVICE_ACCOUNT_JSON', '')
+        if sa_json:
+            cred = credentials.Certificate(json.loads(sa_json))
+        else:
+            cred = credentials.Certificate('serviceAccountKey.json')
+        firebase_admin.initialize_app(cred)
+    _fdb = admin_firestore.client()
+    return _fdb
+PROTECT_PASSWORD = os.environ.get('XLSX_PASSWORD', 'EduTestPro2025')
 CORS = {
     'Access-Control-Allow-Origin':  '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-EduTest-Key',
 }
 
 # ── Style constants ────────────────────────────────────────────────────────────
@@ -42,12 +64,273 @@ _BORDER  = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 NUM_COLS = 9   # #, Name, Email, Class, Arm, Score, %, Result, Date
 
 
+
+# =============================================================================
+# EXAM ENDPOINTS  (server-side delivery + grading via Firebase Admin SDK)
+# =============================================================================
+
+def _verify_token(request):
+    """Verify Firebase ID token. Returns (email, uid) or raises."""
+    hdr = request.headers.get('Authorization', '')
+    if not hdr.startswith('Bearer '):
+        raise PermissionError('Missing or invalid Authorization header')
+    decoded = fb_auth.verify_id_token(hdr[7:])
+    return decoded['email'].lower(), decoded['uid']
+
+
+def _secret_ok(request):
+    secret = os.environ.get('XLSX_SECRET', '')
+    if secret and request.headers.get('X-EduTest-Key', '') != secret:
+        raise PermissionError('Unauthorized')
+
+
+def _json_resp(data, status=200):
+    resp = make_response(json.dumps(data), status)
+    resp.headers['Content-Type'] = 'application/json'
+    for k, v in CORS.items():
+        resp.headers[k] = v
+    return resp
+
+
+def _err(msg, status=400):
+    return _json_resp({'ok': False, 'error': msg}, status)
+
+
+@functions_framework.http
+def get_exam(request: Request):
+    """
+    POST /get-exam
+    Body: { examId }
+    Auth: Bearer <Firebase ID token>
+    Returns exam stripped of correctIndex / correctLetter.
+    """
+    if request.method == 'OPTIONS':
+        return make_response('', 204, CORS)
+    if request.method != 'POST':
+        return _err('Method not allowed', 405)
+    try:
+        _secret_ok(request)
+        email, _ = _verify_token(request)
+        body    = request.get_json(force=True, silent=True) or {}
+        exam_id = (body.get('examId') or '').strip()
+        if not exam_id:
+            return _err('examId required')
+
+        db = _get_db()
+
+        # Verify student is active
+        u = db.collection('users').document(email).get()
+        if not u.exists:
+            return _err('Account not found', 403)
+        ud = u.to_dict()
+        if ud.get('status') != 'active':
+            return _err('Account suspended', 403)
+        if ud.get('role') != 'student':
+            return _err('Only students can take exams', 403)
+
+        # Fetch full exam (Admin SDK bypasses client rules entirely)
+        ex = db.collection('exams').document(exam_id).get()
+        if not ex.exists:
+            return _err('Exam not found', 404)
+        ed = ex.to_dict()
+
+        # School isolation check
+        if ed.get('schoolId') and ed['schoolId'] != ud.get('schoolId'):
+            return _err('Exam not available for your school', 403)
+
+        # Strip correct answers before sending to browser
+        safe_qs = [
+            {'question': q.get('question', ''), 'options': q.get('options', [])}
+            for q in ed.get('questions', [])
+        ]
+
+        return _json_resp({'ok': True, 'exam': {
+            'id':               exam_id,
+            'title':            ed.get('title', ''),
+            'description':      ed.get('description', ''),
+            'duration_minutes': ed.get('duration_minutes', 60),
+            'schoolId':         ed.get('schoolId', ''),
+            'questions':        safe_qs,
+        }})
+
+    except PermissionError as e:
+        return _err(str(e), 403)
+    except Exception as e:
+        return _err(str(e), 500)
+
+
+@functions_framework.http
+def check_submitted(request: Request):
+    """
+    POST /check-submitted
+    Body: { examId }
+    Returns { ok, submitted }
+    """
+    if request.method == 'OPTIONS':
+        return make_response('', 204, CORS)
+    if request.method != 'POST':
+        return _err('Method not allowed', 405)
+    try:
+        _secret_ok(request)
+        email, _ = _verify_token(request)
+        body    = request.get_json(force=True, silent=True) or {}
+        exam_id = (body.get('examId') or '').strip()
+        if not exam_id:
+            return _err('examId required')
+        snap = _get_db().collection('submissions').document(exam_id + '_' + email).get()
+        return _json_resp({'ok': True, 'submitted': snap.exists})
+    except PermissionError as e:
+        return _err(str(e), 403)
+    except Exception as e:
+        return _err(str(e), 500)
+
+
+@functions_framework.http
+def submit_exam(request: Request):
+    """
+    POST /submit-exam
+    Body: {
+        examId, rawAnswers, questionOrder, optionOrders, timeTaken
+    }
+    rawAnswers: { "shuffledQIdx": shuffledOptIdx, ... }
+    questionOrder: [origIdx, ...]          (from _questionOrder)
+    optionOrders:  [[origOptIdx,...], ...] (from _optionOrders)
+    timeTaken: seconds elapsed
+
+    Server grades against correctIndex from Firestore — browser never sees it.
+    Writes submission to Firestore via Admin SDK (bypasses client rules).
+    Returns { ok, correct, wrong, unanswered, total, percentage }
+    """
+    if request.method == 'OPTIONS':
+        return make_response('', 204, CORS)
+    if request.method != 'POST':
+        return _err('Method not allowed', 405)
+    try:
+        _secret_ok(request)
+        email, _ = _verify_token(request)
+        body          = request.get_json(force=True, silent=True) or {}
+        exam_id       = (body.get('examId') or '').strip()
+        raw_answers   = body.get('rawAnswers', {})
+        question_order= body.get('questionOrder', [])
+        option_orders = body.get('optionOrders', [])
+        time_taken    = int(body.get('timeTaken', 0))
+
+        if not exam_id:
+            return _err('examId required')
+
+        db = _get_db()
+
+        # Verify student
+        u  = db.collection('users').document(email).get()
+        if not u.exists:
+            return _err('Account not found', 403)
+        ud = u.to_dict()
+        if ud.get('status') != 'active' or ud.get('role') != 'student':
+            return _err('Not authorised', 403)
+
+        # Prevent double submission
+        doc_id = exam_id + '_' + email
+        if db.collection('submissions').document(doc_id).get().exists:
+            return _err('You have already submitted this exam.', 409)
+
+        # Fetch FULL exam with correct answers
+        ex = db.collection('exams').document(exam_id).get()
+        if not ex.exists:
+            return _err('Exam not found', 404)
+        ed = ex.to_dict()
+
+        if ed.get('schoolId') and ed['schoolId'] != ud.get('schoolId'):
+            return _err('Exam not available for your school', 403)
+
+        orig_qs = ed.get('questions', [])
+        total   = len(orig_qs)
+
+        # Fallback if shuffle orders not sent
+        if not question_order:
+            question_order = list(range(total))
+        if not option_orders:
+            option_orders = [list(range(len(q.get('options', [])))) for q in orig_qs]
+
+        # ── Grade server-side ────────────────────────────────────────────────
+        correct  = 0
+        answered = 0
+        audit    = {}
+
+        for si, orig_qi in enumerate(question_order):
+            if orig_qi >= len(orig_qs):
+                continue
+            oq          = orig_qs[orig_qi]
+            opt_order   = option_orders[si] if si < len(option_orders) else list(range(len(oq.get('options', []))))
+            correct_idx = oq.get('correctIndex', -1)
+            options     = oq.get('options', [])
+
+            picked_s = raw_answers.get(str(si))
+            if picked_s is not None:
+                picked_s    = int(picked_s)
+                answered   += 1
+                picked_orig = opt_order[picked_s] if picked_s < len(opt_order) else None
+            else:
+                picked_orig = None
+
+            is_correct = (picked_orig is not None and picked_orig == correct_idx)
+            if is_correct:
+                correct += 1
+
+            audit[str(orig_qi)] = {
+                'questionText': oq.get('question', ''),
+                'pickedText':   options[picked_orig] if picked_orig is not None and picked_orig < len(options) else '(not answered)',
+                'correctText':  options[correct_idx] if 0 <= correct_idx < len(options) else '',
+                'isCorrect':    is_correct,
+                'notAnswered':  picked_orig is None,
+            }
+
+        wrong      = answered - correct
+        unanswered = total - answered
+        percentage = round(correct / total * 100) if total else 0
+
+        # ── Write to Firestore via Admin SDK ─────────────────────────────────
+        db.collection('submissions').document(doc_id).set({
+            'examId':       exam_id,
+            'examTitle':    ed.get('title', ''),
+            'schoolId':     ed.get('schoolId', ''),
+            'studentEmail': email,
+            'studentName':  (ud.get('name') or '').strip(),
+            'studentClass': (ud.get('classGrade') or '').strip(),
+            'answers':      audit,
+            'score':        correct,
+            'total':        total,
+            'wrong':        wrong,
+            'unanswered':   unanswered,
+            'percentage':   percentage,
+            'timeTaken':    time_taken,
+            'submittedAt':  admin_firestore.SERVER_TIMESTAMP,
+        })
+
+        return _json_resp({
+            'ok': True, 'correct': correct, 'wrong': wrong,
+            'unanswered': unanswered, 'total': total, 'percentage': percentage,
+        })
+
+    except PermissionError as e:
+        return _err(str(e), 403)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return _err(str(e), 500)
+
+
 @functions_framework.http
 def generate_results_xlsx(request: Request):
     if request.method == 'OPTIONS':
         return make_response('', 204, CORS)
     if request.method != 'POST':
         return ('Method not allowed', 405, CORS)
+
+    # ── Shared secret check (F5 fix) ─────────────────────────────────────────
+    api_secret = os.environ.get('XLSX_SECRET', '')
+    if api_secret:
+        provided = request.headers.get('X-EduTest-Key', '')
+        if provided != api_secret:
+            return ('Unauthorized', 401, CORS)
 
     body             = request.get_json(force=True, silent=True) or {}
     title            = str(body.get('title',            'Exam Results'))[:120]
@@ -289,6 +572,13 @@ def generate_audit_xlsx(request: Request):
         return make_response('', 204, CORS)
     if request.method != 'POST':
         return ('Method not allowed', 405, CORS)
+
+    # ── Shared secret check (F5 fix) ─────────────────────────────────────────
+    api_secret = os.environ.get('XLSX_SECRET', '')
+    if api_secret:
+        provided = request.headers.get('X-EduTest-Key', '')
+        if provided != api_secret:
+            return ('Unauthorized', 401, CORS)
 
     body             = request.get_json(force=True, silent=True) or {}
     title            = str(body.get('title',            'Answer Audit'))[:120]
