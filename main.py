@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 from openpyxl import Workbook
 from openpyxl.styles import Protection, Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import functions_framework
-from flask import Request, make_response
+from flask import Flask, request as flask_request, make_response
+app = Flask(__name__)
 
 # ── Firebase Admin SDK ────────────────────────────────────────────────────────
 import firebase_admin
@@ -96,8 +96,9 @@ def _err(msg, status=400):
     return _json_resp({'ok': False, 'error': msg}, status)
 
 
-@functions_framework.http
-def get_exam(request: Request):
+@app.route('/get-exam', methods=['POST','OPTIONS'])
+def get_exam():
+    request = flask_request
     """
     POST /get-exam
     Body: { examId }
@@ -159,8 +160,9 @@ def get_exam(request: Request):
         return _err(str(e), 500)
 
 
-@functions_framework.http
-def check_submitted(request: Request):
+@app.route('/check-submitted', methods=['POST','OPTIONS'])
+def check_submitted():
+    request = flask_request
     """
     POST /check-submitted
     Body: { examId }
@@ -185,8 +187,9 @@ def check_submitted(request: Request):
         return _err(str(e), 500)
 
 
-@functions_framework.http
-def submit_exam(request: Request):
+@app.route('/submit-exam', methods=['POST','OPTIONS'])
+def submit_exam():
+    request = flask_request
     """
     POST /submit-exam
     Body: {
@@ -318,8 +321,77 @@ def submit_exam(request: Request):
         return _err(str(e), 500)
 
 
-@functions_framework.http
-def generate_results_xlsx(request: Request):
+@app.route('/list-exams', methods=['POST','OPTIONS'])
+def list_exams():
+    request = flask_request
+    """
+    POST /list-exams
+    Body: {} (no body needed — student identity from token)
+    Auth: Bearer <Firebase ID token>
+    Returns all active exams for the student's school, minus ones
+    they have already submitted.  No questions or correct answers included.
+    """
+    if request.method == 'OPTIONS':
+        return make_response('', 204, CORS)
+    if request.method != 'POST':
+        return _err('Method not allowed', 405)
+    try:
+        _secret_ok(request)
+        email, _ = _verify_token(request)
+
+        db = _get_db()
+
+        # Verify student
+        u = db.collection('users').document(email).get()
+        if not u.exists:
+            return _err('Account not found', 403)
+        ud = u.to_dict()
+        if ud.get('status') != 'active':
+            return _err('Account suspended', 403)
+        if ud.get('role') != 'student':
+            return _err('Only students can list exams', 403)
+
+        school_id = ud.get('schoolId', '')
+        if not school_id:
+            return _err('No school assigned to this account', 403)
+
+        # Fetch all exams for this school (Admin SDK — bypasses client rules)
+        exams_snap = db.collection('exams').where('schoolId', '==', school_id).get()
+
+        # Fetch this student's submissions to exclude already-done exams
+        subs_snap = db.collection('submissions')             .where('studentEmail', '==', email.lower())             .where('schoolId',     '==', school_id)             .get()
+        submitted_ids = {s.to_dict().get('examId') for s in subs_snap}
+
+        exams_out = []
+        for ex in exams_snap:
+            ed = ex.to_dict()
+            if ex.id in submitted_ids:
+                continue
+            exams_out.append({
+                'id':               ex.id,
+                'title':            ed.get('title', ''),
+                'description':      ed.get('description', ''),
+                'duration_minutes': ed.get('duration_minutes', 60),
+                'targetClass':      ed.get('targetClass', ''),
+                'examTerm':         ed.get('examTerm', ''),
+                'examType':         ed.get('examType', ''),
+                'questionCount':    len(ed.get('questions', [])),
+            })
+
+        # Sort by creation time if available (newest first)
+        exams_out.sort(key=lambda e: e['title'])
+
+        return _json_resp({'ok': True, 'exams': exams_out})
+
+    except PermissionError as e:
+        return _err(str(e), 403)
+    except Exception as e:
+        return _err(str(e), 500)
+
+
+@app.route('/generate_results_xlsx', methods=['POST','OPTIONS'])
+def generate_results_xlsx():
+    request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, CORS)
     if request.method != 'POST':
@@ -566,8 +638,9 @@ def _build_xlsx(title, school, academic_session, term, exam_type, downloaded_by,
 
 AUDIT_NCOLS = 5
 
-@functions_framework.http
-def generate_audit_xlsx(request: Request):
+@app.route('/generate_audit_xlsx', methods=['POST','OPTIONS'])
+def generate_audit_xlsx():
+    request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, CORS)
     if request.method != 'POST':
@@ -782,3 +855,15 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
     _lock_all(ws2)
 
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+# ── Health check ──────────────────────────────────────────────────────────────
+@app.route('/health', methods=['GET'])
+def health():
+    return make_response('{"ok":true}', 200, {'Content-Type':'application/json'})
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
