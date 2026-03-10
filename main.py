@@ -53,8 +53,12 @@ def _get_db():
         traceback.print_exc()
         raise
 PROTECT_PASSWORD = os.environ.get('XLSX_PASSWORD', 'EduTestPro2025')
+# Only accept requests from the Firebase hosting domain.
+# OPTIONS preflight still works (browser sends Origin header automatically).
+ALLOWED_ORIGIN = 'https://edutest-pro-cbt.web.app'
+
 CORS = {
-    'Access-Control-Allow-Origin':  '*',
+    'Access-Control-Allow-Origin':  ALLOWED_ORIGIN,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-EduTest-Key',
 }
@@ -246,6 +250,14 @@ def submit_exam():
         if not exam_id:
             return _err('examId required')
 
+        # ── S4: Payload size guards ───────────────────────────────────────────
+        if not isinstance(raw_answers, dict) or len(raw_answers) > 500:
+            return _err('Invalid or oversized answer payload', 400)
+        if not isinstance(question_order, list) or len(question_order) > 500:
+            return _err('Invalid questionOrder', 400)
+        if not isinstance(option_orders, list) or len(option_orders) > 500:
+            return _err('Invalid optionOrders', 400)
+
         db = _get_db()
 
         # Verify student
@@ -272,6 +284,17 @@ def submit_exam():
 
         orig_qs = ed.get('questions', [])
         total   = len(orig_qs)
+
+        # ── S3: Server-side timer validation ─────────────────────────────────
+        # Allow a 60-second grace period for network latency on top of duration.
+        # time_taken is in seconds; duration_minutes is in minutes.
+        duration_minutes = ed.get('duration_minutes', 0)
+        if duration_minutes and time_taken > 0:
+            max_allowed_secs = duration_minutes * 60 + 60  # +60s grace
+            if time_taken > max_allowed_secs:
+                # Cap it — don't reject, just record the real maximum.
+                # Rejecting could punish students with slow connections.
+                time_taken = max_allowed_secs
 
         # Fallback if shuffle orders not sent
         if not question_order:
