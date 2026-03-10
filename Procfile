@@ -1,1 +1,1 @@
-web: functions-framework --target=generate_results_xlsx --port=$PORT
+web: gunicorn main:app --bind 0.0.0.0:$PORT
