@@ -23,46 +23,33 @@ def _get_db():
         return _fdb
     if not firebase_admin._apps:
         sa_json = os.environ.get('SERVICE_ACCOUNT_JSON', '')
-        print(f'[DB] SERVICE_ACCOUNT_JSON present: {bool(sa_json)}, length: {len(sa_json)}', flush=True)
         if sa_json:
             try:
                 sa_dict = json.loads(sa_json)
-                print(f'[DB] JSON parsed OK, keys: {list(sa_dict.keys())}', flush=True)
             except json.JSONDecodeError as je:
-                print(f'[DB] JSON parse failed: {je}, attempting repair...', flush=True)
                 sa_json_fixed = sa_json.replace('\r\n', '\n')
                 sa_dict = json.loads(sa_json_fixed)
-                print('[DB] JSON repair succeeded', flush=True)
             # Repair private_key if actual newlines were injected
             if 'private_key' in sa_dict:
                 pk = sa_dict['private_key']
-                print(f'[DB] private_key starts with: {repr(pk[:40])}', flush=True)
                 if '\\n' in pk:
                     sa_dict['private_key'] = pk.replace('\\n', '\n')
-                    print('[DB] private_key double-escape repaired', flush=True)
             try:
                 cred = credentials.Certificate(sa_dict)
-                print('[DB] Certificate created OK', flush=True)
             except Exception as ce:
-                print(f'[DB] Certificate creation failed: {ce}', flush=True)
                 traceback.print_exc()
                 raise
         else:
-            print('[DB] No SERVICE_ACCOUNT_JSON — trying serviceAccountKey.json', flush=True)
             cred = credentials.Certificate('serviceAccountKey.json')
         try:
             firebase_admin.initialize_app(cred)
-            print('[DB] firebase_admin.initialize_app() success', flush=True)
         except Exception as ie:
-            print(f'[DB] initialize_app failed: {ie}', flush=True)
             traceback.print_exc()
             raise
     try:
         _fdb = admin_firestore.client()
-        print('[DB] Firestore client created OK', flush=True)
         return _fdb
     except Exception as fe:
-        print(f'[DB] Firestore client failed: {fe}', flush=True)
         traceback.print_exc()
         raise
 PROTECT_PASSWORD = os.environ.get('XLSX_PASSWORD', 'EduTestPro2025')
@@ -422,11 +409,9 @@ def list_exams():
         return _json_resp({'ok': True, 'exams': exams_out})
 
     except PermissionError as e:
-        print(f'[LIST-EXAMS] PermissionError: {e}', flush=True)
         traceback.print_exc()
         return _err(str(e), 403)
     except Exception as e:
-        print(f'[LIST-EXAMS] Exception: {e}', flush=True)
         traceback.print_exc()
         return _err(str(e), 500)
 
@@ -439,12 +424,25 @@ def generate_results_xlsx():
     if request.method != 'POST':
         return ('Method not allowed', 405, CORS)
 
-    # ── Shared secret check (F5 fix) ─────────────────────────────────────────
+    # ── Auth: secret key + Firebase token + staff role ─────────────────────
     api_secret = os.environ.get('XLSX_SECRET', '')
     if api_secret:
         provided = request.headers.get('X-EduTest-Key', '')
         if provided != api_secret:
             return ('Unauthorized', 401, CORS)
+    try:
+        caller_email, _ = _verify_token(request)
+    except PermissionError as e:
+        return _err(str(e), 401)
+
+    # Verify caller is staff (not a student)
+    db = _get_db()
+    caller_doc = db.collection('users').document(caller_email).get()
+    if not caller_doc.exists:
+        return _err('Account not found', 403)
+    caller_data = caller_doc.to_dict()
+    if caller_data.get('role') not in ('super_admin', 'school_admin', 'sub_admin', 'teacher'):
+        return _err('Not authorised', 403)
 
     body             = request.get_json(force=True, silent=True) or {}
     title            = str(body.get('title',            'Exam Results'))[:120]
@@ -688,12 +686,25 @@ def generate_audit_xlsx():
     if request.method != 'POST':
         return ('Method not allowed', 405, CORS)
 
-    # ── Shared secret check (F5 fix) ─────────────────────────────────────────
+    # ── Auth: secret key + Firebase token + staff role ─────────────────────
     api_secret = os.environ.get('XLSX_SECRET', '')
     if api_secret:
         provided = request.headers.get('X-EduTest-Key', '')
         if provided != api_secret:
             return ('Unauthorized', 401, CORS)
+    try:
+        caller_email, _ = _verify_token(request)
+    except PermissionError as e:
+        return _err(str(e), 401)
+
+    # Verify caller is staff (not a student)
+    db = _get_db()
+    caller_doc = db.collection('users').document(caller_email).get()
+    if not caller_doc.exists:
+        return _err('Account not found', 403)
+    caller_data = caller_doc.to_dict()
+    if caller_data.get('role') not in ('super_admin', 'school_admin', 'sub_admin', 'teacher'):
+        return _err('Not authorised', 403)
 
     body             = request.get_json(force=True, silent=True) or {}
     title            = str(body.get('title',            'Answer Audit'))[:120]
