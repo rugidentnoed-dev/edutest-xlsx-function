@@ -55,13 +55,22 @@ def _get_db():
 PROTECT_PASSWORD = os.environ.get('XLSX_PASSWORD', 'EduTestPro2025')
 # Only accept requests from the Firebase hosting domain.
 # OPTIONS preflight still works (browser sends Origin header automatically).
-ALLOWED_ORIGIN = 'https://edutest-pro-cbt.web.app'
-
-CORS = {
-    'Access-Control-Allow-Origin':  ALLOWED_ORIGIN,
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-EduTest-Key',
+ALLOWED_ORIGINS = {
+    'https://edutest-pro-cbt.web.app',
+    'https://edutest-pro-cbt.firebaseapp.com',
 }
+
+def _cors_headers(req=None):
+    origin = (req.headers.get('Origin', '') if req else '') or ''
+    allowed = origin if origin in ALLOWED_ORIGINS else 'https://edutest-pro-cbt.web.app'
+    return {
+        'Access-Control-Allow-Origin':  allowed,
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-EduTest-Key',
+        'Vary': 'Origin',
+    }
+
+CORS = _cors_headers()
 
 # ── Style constants ────────────────────────────────────────────────────────────
 _GREEN      = '1B6B45'   # dark professional green
@@ -113,16 +122,16 @@ def _secret_ok(request):
         raise PermissionError('Unauthorized')
 
 
-def _json_resp(data, status=200):
+def _json_resp(data, status=200, req=None):
     resp = make_response(json.dumps(data), status)
     resp.headers['Content-Type'] = 'application/json'
-    for k, v in CORS.items():
+    for k, v in _cors_headers(req).items():
         resp.headers[k] = v
     return resp
 
 
-def _err(msg, status=400):
-    return _json_resp({'ok': False, 'error': msg}, status)
+def _err(msg, status=400, req=None):
+    return _json_resp({'ok': False, 'error': msg}, status, req)
 
 
 @app.route('/get-exam', methods=['POST','OPTIONS'])
@@ -135,7 +144,7 @@ def get_exam():
     Returns exam stripped of correctIndex / correctLetter.
     """
     if request.method == 'OPTIONS':
-        return make_response('', 204, CORS)
+        return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
         return _err('Method not allowed', 405)
     try:
@@ -198,7 +207,7 @@ def check_submitted():
     Returns { ok, submitted }
     """
     if request.method == 'OPTIONS':
-        return make_response('', 204, CORS)
+        return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
         return _err('Method not allowed', 405)
     try:
@@ -234,7 +243,7 @@ def submit_exam():
     Returns { ok, correct, wrong, unanswered, total, percentage }
     """
     if request.method == 'OPTIONS':
-        return make_response('', 204, CORS)
+        return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
         return _err('Method not allowed', 405)
     try:
@@ -380,7 +389,7 @@ def list_exams():
     they have already submitted.  No questions or correct answers included.
     """
     if request.method == 'OPTIONS':
-        return make_response('', 204, CORS)
+        return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
         return _err('Method not allowed', 405)
     try:
@@ -443,7 +452,7 @@ def list_exams():
 def generate_results_xlsx():
     request = flask_request
     if request.method == 'OPTIONS':
-        return make_response('', 204, CORS)
+        return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
         return ('Method not allowed', 405, CORS)
 
@@ -705,7 +714,7 @@ AUDIT_NCOLS = 5
 def generate_audit_xlsx():
     request = flask_request
     if request.method == 'OPTIONS':
-        return make_response('', 204, CORS)
+        return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
         return ('Method not allowed', 405, CORS)
 
