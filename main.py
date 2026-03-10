@@ -22,7 +22,21 @@ def _get_db():
     if not firebase_admin._apps:
         sa_json = os.environ.get('SERVICE_ACCOUNT_JSON', '')
         if sa_json:
-            cred = credentials.Certificate(json.loads(sa_json))
+            # Render sometimes converts \n to real newlines inside the JSON string,
+            # breaking json.loads(). Fix: if parsing fails, try repairing the key.
+            try:
+                sa_dict = json.loads(sa_json)
+            except json.JSONDecodeError:
+                # Attempt repair: replace literal newlines inside the value with \n
+                sa_json_fixed = sa_json.replace('\r\n', '\n')
+                sa_dict = json.loads(sa_json_fixed)
+            # Repair private_key if actual newlines were injected
+            if 'private_key' in sa_dict:
+                pk = sa_dict['private_key']
+                if '\\n' in pk:
+                    # Double-escaped — fix to single \n
+                    sa_dict['private_key'] = pk.replace('\\n', '\n')
+            cred = credentials.Certificate(sa_dict)
         else:
             cred = credentials.Certificate('serviceAccountKey.json')
         firebase_admin.initialize_app(cred)
