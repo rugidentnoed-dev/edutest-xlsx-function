@@ -85,6 +85,7 @@ NUM_COLS = 9   # #, Name, Email, Class, Arm, Score, %, Result, Date
 
 def _verify_token(request):
     """Verify Firebase ID token. Returns (email, uid) or raises."""
+    _get_db()  # Ensure Firebase Admin is initialized before using fb_auth
     hdr = request.headers.get('Authorization', '')
     if not hdr.startswith('Bearer '):
         raise PermissionError('Missing or invalid Authorization header')
@@ -869,6 +870,16 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
     _lock_all(ws2)
 
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+# ── Eager Firebase init at startup ────────────────────────────────────────────
+# Initialize Firebase Admin when gunicorn loads the module, not lazily per-request.
+# This catches missing SERVICE_ACCOUNT_JSON immediately on startup.
+try:
+    _get_db()
+    print('[STARTUP] Firebase Admin initialized successfully')
+except Exception as _e:
+    print('[STARTUP] WARNING: Firebase Admin init failed:', _e)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
