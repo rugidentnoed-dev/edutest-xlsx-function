@@ -291,6 +291,16 @@ def submit_exam():
         if ed.get('schoolId') and ed['schoolId'] != ud.get('schoolId'):
             return _err('Exam not available for your school', 403)
 
+        # Block expired exams
+        close_date_str = ed.get('closeDate')
+        if close_date_str:
+            try:
+                close_dt = datetime.fromisoformat(close_date_str.replace('Z', '+00:00'))
+                if datetime.now(timezone.utc) > close_dt:
+                    return _err('This exam has closed and is no longer available.', 403)
+            except Exception:
+                pass
+
         orig_qs = ed.get('questions', [])
         total   = len(orig_qs)
 
@@ -419,11 +429,21 @@ def list_exams():
         subs_snap = db.collection('submissions')             .where('studentEmail', '==', email.lower())             .where('schoolId',     '==', school_id)             .get()
         submitted_ids = {s.to_dict().get('examId') for s in subs_snap}
 
+        now       = datetime.now(timezone.utc)
         exams_out = []
         for ex in exams_snap:
             ed = ex.to_dict()
             if ex.id in submitted_ids:
                 continue
+            # Skip expired exams — closeDate is an ISO string stored by the client
+            close_date_str = ed.get('closeDate')
+            if close_date_str:
+                try:
+                    close_dt = datetime.fromisoformat(close_date_str.replace('Z', '+00:00'))
+                    if now > close_dt:
+                        continue  # exam has expired — hide from student
+                except Exception:
+                    pass  # malformed date — show the exam anyway
             exams_out.append({
                 'id':               ex.id,
                 'title':            ed.get('title', ''),
@@ -433,6 +453,7 @@ def list_exams():
                 'examTerm':         ed.get('examTerm', ''),
                 'examType':         ed.get('examType', ''),
                 'questionCount':    len(ed.get('questions', [])),
+                'closeDate':        close_date_str or None,
             })
 
         # Sort by creation time if available (newest first)
