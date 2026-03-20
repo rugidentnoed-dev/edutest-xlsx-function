@@ -3,6 +3,7 @@ import os
 import json
 import sys
 import traceback
+import requests
 from datetime import datetime, timezone
 from openpyxl import Workbook
 from openpyxl.styles import Protection, Font, PatternFill, Alignment, Border, Side
@@ -384,7 +385,8 @@ def submit_exam():
     except PermissionError as e:
         return _err(str(e), 403)
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return _err(str(e), 500)
 
 
@@ -961,6 +963,170 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
     _lock_all(ws2)
 
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+# ── Paystack payment verification ────────────────────────────────────────────
+
+@app.route('/init-payment', methods=['POST','OPTIONS'])
+def init_payment():
+    """
+    Initialize a Paystack transaction and return the authorization_url.
+    Called by the client (school_admin) to start a redirect payment flow.
+    The secret key stays on the server — never exposed to the browser.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _cors_headers(request))
+    if request.method != 'POST':
+        return _err('Method not allowed', 405, request)
+    try:
+        _secret_ok(request)
+        caller_email, _ = _verify_token(request)
+
+        # Verify caller is school_admin
+        db = _get_db()
+        caller_doc = db.collection('users').document(caller_email).get()
+        if not caller_doc.exists:
+            return _err('Account not found', 403, request)
+        caller_data = caller_doc.to_dict()
+        if caller_data.get('role') not in ('school_admin', 'super_admin'):
+            return _err('Not authorised', 403, request)
+
+        body      = request.get_json(force=True, silent=True) or {}
+        school_id = (body.get('schoolId') or '').strip()
+        amount    = int(body.get('amount', 0))        # in NGN (not kobo)
+        email     = (body.get('email')    or '').strip()
+        reference = (body.get('reference') or '').strip()
+        callback  = (body.get('callbackUrl') or 'https://edutest-pro-cbt.web.app/app.html').strip()
+
+        if not school_id or not amount or not email:
+            return _err('schoolId, amount, and email are required', 400, request)
+
+        # Verify caller belongs to this school (unless super_admin)
+        if caller_data.get('role') == 'school_admin':
+            if caller_data.get('schoolId') != school_id:
+                return _err('Not authorised for this school', 403, request)
+
+        paystack_secret = os.environ.get('PAYSTACK_SECRET_KEY', '')
+        if not paystack_secret:
+            return _err('Payment gateway not configured on server', 500, request)
+
+        # Call Paystack Initialize API with the secret key (server-side only)
+        resp = requests.post(
+            'https://api.paystack.co/transaction/initialize',
+            headers={
+                'Authorization': f'Bearer {paystack_secret}',
+                'Content-Type':  'application/json',
+            },
+            json={
+                'email':        email,
+                'amount':       amount * 100,   # convert NGN to kobo
+                'currency':     'NGN',
+                'reference':    reference,
+                'callback_url': callback,
+                'metadata': {
+                    'custom_fields': [
+                        {'display_name': 'School ID',  'variable_name': 'school_id',  'value': school_id},
+                        {'display_name': 'Renewed By', 'variable_name': 'renewed_by', 'value': email},
+                    ],
+                },
+            },
+            timeout=15,
+        )
+        data = resp.json()
+
+        if not resp.ok or not data.get('status') or not data.get('data', {}).get('authorization_url'):
+            msg = data.get('message', 'Paystack initialization failed')
+            return _err(msg, 400, request)
+
+        return _json_resp({
+            'ok':              True,
+            'authorization_url': data['data']['authorization_url'],
+            'reference':         data['data']['reference'],
+            'access_code':       data['data'].get('access_code', ''),
+        }, req=request)
+
+    except PermissionError as e:
+        return _err(str(e), 403, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _err(str(e), 500, request)
+
+
+@app.route('/verify-payment', methods=['POST','OPTIONS'])
+def verify_payment():
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _cors_headers(request))
+    if request.method != 'POST':
+        return _err('Method not allowed', 405, request)
+    try:
+        _secret_ok(request)
+        caller_email, _ = _verify_token(request)
+
+        # Verify caller is school_admin
+        db = _get_db()
+        caller_doc = db.collection('users').document(caller_email).get()
+        if not caller_doc.exists:
+            return _err('Account not found', 403, request)
+        caller_data = caller_doc.to_dict()
+        if caller_data.get('role') not in ('school_admin', 'super_admin'):
+            return _err('Not authorised', 403, request)
+
+        body      = request.get_json(force=True, silent=True) or {}
+        reference = (body.get('reference') or '').strip()
+        school_id = (body.get('schoolId')   or '').strip()
+        amount    = int(body.get('amount', 0))
+
+        if not reference or not school_id:
+            return _err('reference and schoolId required', 400, request)
+
+        # Verify with Paystack API
+        paystack_secret = os.environ.get('PAYSTACK_SECRET_KEY', '')
+        if not paystack_secret:
+            return _err('Payment gateway not configured', 500, request)
+
+        resp = requests.get(
+            f'https://api.paystack.co/transaction/verify/{reference}',
+            headers={'Authorization': f'Bearer {paystack_secret}'},
+            timeout=10,
+        )
+        data = resp.json()
+
+        if not data.get('status') or data.get('data', {}).get('status') != 'success':
+            return _err('Payment not successful', 402, request)
+
+        paid_amount_kobo = data['data'].get('amount', 0)
+        if paid_amount_kobo < amount * 100:
+            return _err('Payment amount insufficient', 402, request)
+
+        # Activate subscription — set start to today, duration from school doc
+        school_snap = db.collection('schools').document(school_id).get()
+        if not school_snap.exists:
+            return _err('School not found', 404, request)
+        school_data = school_snap.to_dict()
+
+        # Verify caller belongs to this school (unless super_admin)
+        if caller_data.get('role') == 'school_admin':
+            if caller_data.get('schoolId') != school_id:
+                return _err('Not authorised for this school', 403, request)
+
+        sub_days = school_data.get('subscriptionDays', 270)
+        db.collection('schools').document(school_id).update({
+            'subscriptionStart': datetime.now(timezone.utc).isoformat(),
+            'subscriptionDays':  sub_days,
+            'lastPaymentRef':    reference,
+            'lastPaymentAmount': paid_amount_kobo // 100,
+            'lastPaymentDate':   datetime.now(timezone.utc).isoformat(),
+        })
+
+        return _json_resp({'ok': True, 'message': 'Subscription activated'}, req=request)
+
+    except PermissionError as e:
+        return _err(str(e), 403, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _err(str(e), 500, request)
 
 
 # ── Eager Firebase init at startup ────────────────────────────────────────────
