@@ -1139,6 +1139,336 @@ except Exception as _e:
     print('[STARTUP] WARNING: Firebase Admin init failed:', _e)
 
 
+
+# =============================================================================
+# RDS — Result Distribution System Integration
+# Token bridge: CBT generates signed HMAC-SHA256 token → RDS validates it
+# =============================================================================
+
+import hmac
+import hashlib
+import base64
+import uuid
+
+RDS_URL = os.environ.get('RDS_URL', 'https://edutest-rds.web.app')
+
+
+def _rds_secret():
+    secret = os.environ.get('RDS_BRIDGE_SECRET', '')
+    if not secret:
+        raise PermissionError('RDS_BRIDGE_SECRET not configured on server')
+    return secret
+
+
+def _make_rds_cors(req=None):
+    """CORS headers that also allow the RDS frontend origin."""
+    origin = (req.headers.get('Origin', '') if req else '') or ''
+    allowed_origins = {
+        'https://edutest-pro-cbt.web.app',
+        'https://edutest-pro-cbt.firebaseapp.com',
+        RDS_URL,
+        RDS_URL.replace('https://', 'https://www.'),
+    }
+    allowed = origin if origin in allowed_origins else 'https://edutest-pro-cbt.web.app'
+    return {
+        'Access-Control-Allow-Origin':  allowed,
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-EduTest-Key',
+        'Vary': 'Origin',
+    }
+
+
+@app.route('/launch-rds', methods=['POST', 'OPTIONS'])
+def launch_rds():
+    """
+    Called by CBT app.js when a user clicks "Result Distribution".
+    Generates a signed one-time token and returns the RDS redirect URL.
+    Only school_admin, sub_admin, teacher, and super_admin can access RDS.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+
+    try:
+        _secret_ok(request)
+        caller_email, _ = _verify_token(request)
+
+        db = _get_db()
+        caller_doc = db.collection('users').document(caller_email).get()
+        if not caller_doc.exists:
+            return _json_resp({'ok': False, 'error': 'Account not found'}, 403, request)
+
+        caller = caller_doc.to_dict()
+        allowed_roles = ('super_admin', 'school_admin', 'sub_admin', 'teacher')
+        if caller.get('role') not in allowed_roles:
+            return _json_resp({'ok': False, 'error': 'Your role does not have access to Result Distribution System.'}, 403, request)
+
+        # Build token payload
+        nonce = uuid.uuid4().hex
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        payload = {
+            'uid':      caller_email,
+            'role':     caller.get('role'),
+            'schoolId': caller.get('schoolId', ''),
+            'email':    caller_email,
+            'name':     caller.get('name', caller_email),
+            'iat':      now_ms,
+            'exp':      now_ms + 60000,   # 60-second window
+            'nonce':    nonce,
+        }
+
+        # Encode and sign
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(',', ':')).encode()
+        ).rstrip(b'=').decode()
+
+        sig = hmac.new(
+            _rds_secret().encode(),
+            encoded.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        token = f'{encoded}.{sig}'
+
+        # Store nonce in Firestore (one-time use enforcement)
+        db.collection('rds_nonces').document(nonce).set({
+            'uid':      caller_email,
+            'schoolId': caller.get('schoolId', ''),
+            'usedAt':   None,
+            'expiresAt': datetime.fromtimestamp((now_ms + 60000) / 1000, tz=timezone.utc),
+            'createdAt': datetime.now(timezone.utc),
+        })
+
+        redirect_url = f'{RDS_URL}/rds.html?token={requests.utils.quote(token)}'
+        return _json_resp({'ok': True, 'redirectUrl': redirect_url}, req=request)
+
+    except PermissionError as e:
+        return _json_resp({'ok': False, 'error': str(e)}, 403, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-verify', methods=['POST', 'OPTIONS'])
+def rds_verify():
+    """
+    Called by rds.html AccessGate on first load.
+    Verifies the token, consumes the nonce, creates an 8-hour session.
+    No auth header needed here — the token IS the credential.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        token = (body.get('token') or '').strip()
+
+        if not token or '.' not in token:
+            return _json_resp({'ok': False, 'errorCode': 'INVALID_TOKEN_FORMAT',
+                'message': 'Malformed access token. Please try again from CBT.'}, 400, request)
+
+        # Split token
+        parts = token.rsplit('.', 1)
+        if len(parts) != 2:
+            return _json_resp({'ok': False, 'errorCode': 'INVALID_TOKEN_FORMAT',
+                'message': 'Malformed access token.'}, 400, request)
+
+        encoded, received_sig = parts
+
+        # Verify signature
+        expected_sig = hmac.new(
+            _rds_secret().encode(),
+            encoded.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected_sig, received_sig):
+            return _json_resp({'ok': False, 'errorCode': 'INVALID_SIGNATURE',
+                'message': 'Access token signature is invalid. Please try again from CBT.'}, 401, request)
+
+        # Decode payload
+        try:
+            padding = 4 - len(encoded) % 4
+            padded = encoded + '=' * (padding % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded).decode())
+        except Exception:
+            return _json_resp({'ok': False, 'errorCode': 'INVALID_PAYLOAD',
+                'message': 'Access token data is corrupted. Please try again from CBT.'}, 400, request)
+
+        # Check required fields
+        required = ('uid', 'role', 'email', 'name', 'iat', 'exp', 'nonce')
+        if not all(k in payload for k in required):
+            return _json_resp({'ok': False, 'errorCode': 'INCOMPLETE_PAYLOAD',
+                'message': 'Access token is missing required data. Please try again from CBT.'}, 400, request)
+
+        # Check expiry
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if now_ms > payload['exp']:
+            return _json_resp({'ok': False, 'errorCode': 'TOKEN_EXPIRED',
+                'message': 'Access token has expired. Please click Result Distribution again in CBT.'}, 401, request)
+
+        # Check nonce (one-time use)
+        db = _get_db()
+        nonce = payload['nonce']
+        nonce_doc = db.collection('rds_nonces').document(nonce).get()
+
+        if not nonce_doc.exists:
+            return _json_resp({'ok': False, 'errorCode': 'INVALID_NONCE',
+                'message': 'Invalid access token. Please try again from CBT.'}, 401, request)
+
+        nonce_data = nonce_doc.to_dict()
+        if nonce_data.get('usedAt') is not None:
+            return _json_resp({'ok': False, 'errorCode': 'TOKEN_ALREADY_USED',
+                'message': 'This access token has already been used. Please click Result Distribution again in CBT.'}, 401, request)
+
+        # Mark nonce as used
+        db.collection('rds_nonces').document(nonce).update({
+            'usedAt': datetime.now(timezone.utc)
+        })
+
+        # Check school subscription (skip for super_admin)
+        role = payload['role']
+        school_id = payload.get('schoolId', '')
+        if role != 'super_admin' and school_id:
+            school_snap = db.collection('schools').document(school_id).get()
+            if school_snap.exists:
+                school_data = school_snap.to_dict()
+                # Use the same calcSubStatus logic as the frontend
+                sub_start = school_data.get('subscriptionStart')
+                sub_days  = school_data.get('subscriptionDays', 0)
+                grace     = school_data.get('gracePeriodDays', 7)
+                paused    = school_data.get('subscriptionPaused', False)
+
+                if paused:
+                    return _json_resp({'ok': False, 'errorCode': 'SUBSCRIPTION_PAUSED',
+                        'message': 'Result Distribution is not available — subscription is paused. Contact support.'}, 403, request)
+
+                if sub_start and sub_days:
+                    from datetime import timedelta
+                    start_dt = datetime.fromisoformat(sub_start.replace('Z', '+00:00')) if isinstance(sub_start, str) else sub_start
+                    expiry   = start_dt + timedelta(days=sub_days)
+                    grace_end = expiry + timedelta(days=grace)
+                    now_dt    = datetime.now(timezone.utc)
+                    if now_dt > grace_end:
+                        return _json_resp({'ok': False, 'errorCode': 'SUBSCRIPTION_EXPIRED',
+                            'message': 'RDS subscription has expired. Please renew in EduTest Pro CBT.'}, 403, request)
+
+        # Create 8-hour session
+        session_id = str(uuid.uuid4())
+        expires_at = datetime.now(timezone.utc).replace(
+            second=0, microsecond=0
+        )
+        from datetime import timedelta
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=8)
+
+        session_data = {
+            'sessionId': session_id,
+            'uid':       payload['uid'],
+            'role':      role,
+            'schoolId':  school_id,
+            'email':     payload['email'],
+            'name':      payload['name'],
+            'createdAt': datetime.now(timezone.utc),
+            'expiresAt': expires_at,
+            'lastActive': datetime.now(timezone.utc),
+        }
+        db.collection('rds_sessions').document(session_id).set(session_data)
+
+        return _json_resp({
+            'ok':        True,
+            'sessionId': session_id,
+            'user': {
+                'uid':      payload['uid'],
+                'role':     role,
+                'schoolId': school_id,
+                'email':    payload['email'],
+                'name':     payload['name'],
+            },
+            'expiresAt': expires_at.isoformat(),
+        }, req=request)
+
+    except PermissionError as e:
+        return _json_resp({'ok': False, 'error': str(e)}, 403, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-validate-session', methods=['POST', 'OPTIONS'])
+def rds_validate_session():
+    """Validate an existing RDS session. Called on every RDS page load."""
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        session_id = (body.get('sessionId') or '').strip()
+
+        if not session_id:
+            return _json_resp({'valid': False, 'reason': 'NO_SESSION'}, 401, request)
+
+        db = _get_db()
+        snap = db.collection('rds_sessions').document(session_id).get()
+
+        if not snap.exists:
+            return _json_resp({'valid': False, 'reason': 'SESSION_NOT_FOUND'}, 401, request)
+
+        sess = snap.to_dict()
+        expires_at = sess.get('expiresAt')
+
+        # Handle both datetime objects and strings
+        if isinstance(expires_at, str):
+            from datetime import timedelta
+            expires_at = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+
+        if expires_at and datetime.now(timezone.utc) > expires_at:
+            db.collection('rds_sessions').document(session_id).delete()
+            return _json_resp({'valid': False, 'reason': 'SESSION_EXPIRED'}, 401, request)
+
+        # Update lastActive
+        db.collection('rds_sessions').document(session_id).update({
+            'lastActive': datetime.now(timezone.utc)
+        })
+
+        return _json_resp({
+            'valid': True,
+            'user': {
+                'uid':      sess.get('uid'),
+                'role':     sess.get('role'),
+                'schoolId': sess.get('schoolId'),
+                'email':    sess.get('email'),
+                'name':     sess.get('name'),
+            },
+        }, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _json_resp({'valid': False, 'reason': str(e)}, 500, request)
+
+
+@app.route('/rds-logout', methods=['POST', 'OPTIONS'])
+def rds_logout():
+    """Destroy an RDS session."""
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        session_id = (body.get('sessionId') or '').strip()
+
+        if session_id:
+            db = _get_db()
+            db.collection('rds_sessions').document(session_id).delete()
+
+        return _json_resp({'ok': True}, req=request)
+
+    except Exception as e:
+        return _json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
 # ── Health check ──────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
