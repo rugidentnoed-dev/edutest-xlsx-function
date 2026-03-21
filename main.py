@@ -1239,7 +1239,7 @@ def launch_rds():
             'createdAt': datetime.now(timezone.utc),
         })
 
-        redirect_url = f'{RDS_URL}/rds.html?token={requests.utils.quote(token)}'
+        redirect_url = f'{RDS_URL}/access?token={requests.utils.quote(token)}'
         return _json_resp({'ok': True, 'redirectUrl': redirect_url}, req=request)
 
     except PermissionError as e:
