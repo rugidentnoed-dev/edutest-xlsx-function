@@ -1161,19 +1161,37 @@ def _rds_secret():
 
 
 def _make_rds_cors(req=None):
-    """CORS headers that also allow the RDS frontend origin."""
+    """CORS headers that allow both CBT and RDS frontend origins."""
     origin = (req.headers.get('Origin', '') if req else '') or ''
+
+    # Build set of allowed origins — includes all known Firebase Hosting domains
+    rds_base = RDS_URL.rstrip('/')
     allowed_origins = {
+        # CBT origins
         'https://edutest-pro-cbt.web.app',
         'https://edutest-pro-cbt.firebaseapp.com',
-        RDS_URL,
-        RDS_URL.replace('https://', 'https://www.'),
+        # RDS origins (web.app and firebaseapp.com variants)
+        rds_base,
+        rds_base.replace('.web.app', '.firebaseapp.com'),
+        rds_base + ':443',
     }
-    allowed = origin if origin in allowed_origins else 'https://edutest-pro-cbt.web.app'
+
+    # Allow any *.web.app or *.firebaseapp.com origin (all Firebase Hosting)
+    is_firebase = (
+        origin.endswith('.web.app') or
+        origin.endswith('.firebaseapp.com')
+    )
+
+    if origin in allowed_origins or is_firebase:
+        allowed = origin
+    else:
+        allowed = rds_base
+
     return {
         'Access-Control-Allow-Origin':  allowed,
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-EduTest-Key',
+        'Access-Control-Allow-Credentials': 'false',
         'Vary': 'Origin',
     }
 
