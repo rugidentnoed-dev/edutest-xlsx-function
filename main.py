@@ -131,6 +131,15 @@ def _json_resp(data, status=200, req=None):
     return resp
 
 
+def _rds_json_resp(data, status=200, req=None):
+    """Like _json_resp but uses _make_rds_cors to allow RDS frontend origin."""
+    resp = make_response(json.dumps(data), status)
+    resp.headers['Content-Type'] = 'application/json'
+    for k, v in _make_rds_cors(req).items():
+        resp.headers[k] = v
+    return resp
+
+
 def _err(msg, status=400, req=None):
     return _json_resp({'ok': False, 'error': msg}, status, req)
 
@@ -1140,6 +1149,18 @@ except Exception as _e:
 
 
 
+
+# ── Eager Firebase init at startup ────────────────────────────────────────────
+# Initialize Firebase Admin when gunicorn loads the module, not lazily per-request.
+# This catches missing SERVICE_ACCOUNT_JSON immediately on startup.
+try:
+    _get_db()
+    print('[STARTUP] Firebase Admin initialized successfully')
+except Exception as _e:
+    print('[STARTUP] WARNING: Firebase Admin init failed:', _e)
+
+
+
 # =============================================================================
 # RDS — Result Distribution System Integration
 # Token bridge: CBT generates signed HMAC-SHA256 token → RDS validates it
@@ -1214,12 +1235,12 @@ def launch_rds():
         db = _get_db()
         caller_doc = db.collection('users').document(caller_email).get()
         if not caller_doc.exists:
-            return _json_resp({'ok': False, 'error': 'Account not found'}, 403, request)
+            return _rds_json_resp({'ok': False, 'error': 'Account not found'}, 403, request)
 
         caller = caller_doc.to_dict()
         allowed_roles = ('super_admin', 'school_admin', 'sub_admin', 'teacher')
         if caller.get('role') not in allowed_roles:
-            return _json_resp({'ok': False, 'error': 'Your role does not have access to Result Distribution System.'}, 403, request)
+            return _rds_json_resp({'ok': False, 'error': 'Your role does not have access to Result Distribution System.'}, 403, request)
 
         # Build token payload
         nonce = uuid.uuid4().hex
@@ -1258,13 +1279,13 @@ def launch_rds():
         })
 
         redirect_url = f'{RDS_URL}/access?token={requests.utils.quote(token)}'
-        return _json_resp({'ok': True, 'redirectUrl': redirect_url}, req=request)
+        return _rds_json_resp({'ok': True, 'redirectUrl': redirect_url}, req=request)
 
     except PermissionError as e:
-        return _json_resp({'ok': False, 'error': str(e)}, 403, request)
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 403, request)
     except Exception as e:
         traceback.print_exc()
-        return _json_resp({'ok': False, 'error': str(e)}, 500, request)
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
 
 
 @app.route('/rds-verify', methods=['POST', 'OPTIONS'])
@@ -1283,13 +1304,13 @@ def rds_verify():
         token = (body.get('token') or '').strip()
 
         if not token or '.' not in token:
-            return _json_resp({'ok': False, 'errorCode': 'INVALID_TOKEN_FORMAT',
+            return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_TOKEN_FORMAT',
                 'message': 'Malformed access token. Please try again from CBT.'}, 400, request)
 
         # Split token
         parts = token.rsplit('.', 1)
         if len(parts) != 2:
-            return _json_resp({'ok': False, 'errorCode': 'INVALID_TOKEN_FORMAT',
+            return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_TOKEN_FORMAT',
                 'message': 'Malformed access token.'}, 400, request)
 
         encoded, received_sig = parts
@@ -1302,7 +1323,7 @@ def rds_verify():
         ).hexdigest()
 
         if not hmac.compare_digest(expected_sig, received_sig):
-            return _json_resp({'ok': False, 'errorCode': 'INVALID_SIGNATURE',
+            return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_SIGNATURE',
                 'message': 'Access token signature is invalid. Please try again from CBT.'}, 401, request)
 
         # Decode payload
@@ -1311,19 +1332,19 @@ def rds_verify():
             padded = encoded + '=' * (padding % 4)
             payload = json.loads(base64.urlsafe_b64decode(padded).decode())
         except Exception:
-            return _json_resp({'ok': False, 'errorCode': 'INVALID_PAYLOAD',
+            return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_PAYLOAD',
                 'message': 'Access token data is corrupted. Please try again from CBT.'}, 400, request)
 
         # Check required fields
         required = ('uid', 'role', 'email', 'name', 'iat', 'exp', 'nonce')
         if not all(k in payload for k in required):
-            return _json_resp({'ok': False, 'errorCode': 'INCOMPLETE_PAYLOAD',
+            return _rds_json_resp({'ok': False, 'errorCode': 'INCOMPLETE_PAYLOAD',
                 'message': 'Access token is missing required data. Please try again from CBT.'}, 400, request)
 
         # Check expiry
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         if now_ms > payload['exp']:
-            return _json_resp({'ok': False, 'errorCode': 'TOKEN_EXPIRED',
+            return _rds_json_resp({'ok': False, 'errorCode': 'TOKEN_EXPIRED',
                 'message': 'Access token has expired. Please click Result Distribution again in CBT.'}, 401, request)
 
         # Check nonce (one-time use)
@@ -1332,12 +1353,12 @@ def rds_verify():
         nonce_doc = db.collection('rds_nonces').document(nonce).get()
 
         if not nonce_doc.exists:
-            return _json_resp({'ok': False, 'errorCode': 'INVALID_NONCE',
+            return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_NONCE',
                 'message': 'Invalid access token. Please try again from CBT.'}, 401, request)
 
         nonce_data = nonce_doc.to_dict()
         if nonce_data.get('usedAt') is not None:
-            return _json_resp({'ok': False, 'errorCode': 'TOKEN_ALREADY_USED',
+            return _rds_json_resp({'ok': False, 'errorCode': 'TOKEN_ALREADY_USED',
                 'message': 'This access token has already been used. Please click Result Distribution again in CBT.'}, 401, request)
 
         # Mark nonce as used
@@ -1359,7 +1380,7 @@ def rds_verify():
                 paused    = school_data.get('subscriptionPaused', False)
 
                 if paused:
-                    return _json_resp({'ok': False, 'errorCode': 'SUBSCRIPTION_PAUSED',
+                    return _rds_json_resp({'ok': False, 'errorCode': 'SUBSCRIPTION_PAUSED',
                         'message': 'Result Distribution is not available — subscription is paused. Contact support.'}, 403, request)
 
                 if sub_start and sub_days:
@@ -1369,7 +1390,7 @@ def rds_verify():
                     grace_end = expiry + timedelta(days=grace)
                     now_dt    = datetime.now(timezone.utc)
                     if now_dt > grace_end:
-                        return _json_resp({'ok': False, 'errorCode': 'SUBSCRIPTION_EXPIRED',
+                        return _rds_json_resp({'ok': False, 'errorCode': 'SUBSCRIPTION_EXPIRED',
                             'message': 'RDS subscription has expired. Please renew in EduTest Pro CBT.'}, 403, request)
 
         # Create 8-hour session
@@ -1393,7 +1414,7 @@ def rds_verify():
         }
         db.collection('rds_sessions').document(session_id).set(session_data)
 
-        return _json_resp({
+        return _rds_json_resp({
             'ok':        True,
             'sessionId': session_id,
             'user': {
@@ -1407,10 +1428,10 @@ def rds_verify():
         }, req=request)
 
     except PermissionError as e:
-        return _json_resp({'ok': False, 'error': str(e)}, 403, request)
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 403, request)
     except Exception as e:
         traceback.print_exc()
-        return _json_resp({'ok': False, 'error': str(e)}, 500, request)
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
 
 
 @app.route('/rds-validate-session', methods=['POST', 'OPTIONS'])
@@ -1425,13 +1446,13 @@ def rds_validate_session():
         session_id = (body.get('sessionId') or '').strip()
 
         if not session_id:
-            return _json_resp({'valid': False, 'reason': 'NO_SESSION'}, 401, request)
+            return _rds_json_resp({'valid': False, 'reason': 'NO_SESSION'}, 401, request)
 
         db = _get_db()
         snap = db.collection('rds_sessions').document(session_id).get()
 
         if not snap.exists:
-            return _json_resp({'valid': False, 'reason': 'SESSION_NOT_FOUND'}, 401, request)
+            return _rds_json_resp({'valid': False, 'reason': 'SESSION_NOT_FOUND'}, 401, request)
 
         sess = snap.to_dict()
         expires_at = sess.get('expiresAt')
@@ -1443,14 +1464,14 @@ def rds_validate_session():
 
         if expires_at and datetime.now(timezone.utc) > expires_at:
             db.collection('rds_sessions').document(session_id).delete()
-            return _json_resp({'valid': False, 'reason': 'SESSION_EXPIRED'}, 401, request)
+            return _rds_json_resp({'valid': False, 'reason': 'SESSION_EXPIRED'}, 401, request)
 
         # Update lastActive
         db.collection('rds_sessions').document(session_id).update({
             'lastActive': datetime.now(timezone.utc)
         })
 
-        return _json_resp({
+        return _rds_json_resp({
             'valid': True,
             'user': {
                 'uid':      sess.get('uid'),
@@ -1463,7 +1484,7 @@ def rds_validate_session():
 
     except Exception as e:
         traceback.print_exc()
-        return _json_resp({'valid': False, 'reason': str(e)}, 500, request)
+        return _rds_json_resp({'valid': False, 'reason': str(e)}, 500, request)
 
 
 @app.route('/rds-logout', methods=['POST', 'OPTIONS'])
@@ -1481,10 +1502,10 @@ def rds_logout():
             db = _get_db()
             db.collection('rds_sessions').document(session_id).delete()
 
-        return _json_resp({'ok': True}, req=request)
+        return _rds_json_resp({'ok': True}, req=request)
 
     except Exception as e:
-        return _json_resp({'ok': False, 'error': str(e)}, 500, request)
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
