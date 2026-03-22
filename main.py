@@ -1508,6 +1508,418 @@ def rds_logout():
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
 
 
+
+# =============================================================================
+# RDS — Phase 1: Student Registration
+# Collection: rds_students (in CBT Firestore, edutest-pro-6dd48)
+# 
+# Document schema:
+#   id            : auto-generated
+#   schoolId      : from session
+#   teacherId     : uid of teacher who added/manages this student
+#   name          : student full name
+#   email         : student Gmail (nullable for non-CBT students)
+#   classGrade    : e.g. "SS2A", "JSS1B"
+#   admissionNumber: school admission number (optional)
+#   parentEmail   : parent/guardian email for result delivery
+#   parentWhatsapp: parent WhatsApp number (with country code)
+#   source        : "cbt" | "manual"
+#   cbtSynced     : true if pulled from CBT users collection
+#   createdAt     : timestamp
+#   updatedAt     : timestamp
+#   createdBy     : teacher uid
+# =============================================================================
+
+
+@app.route('/rds-students/list', methods=['POST', 'OPTIONS'])
+def rds_students_list():
+    """
+    List all RDS students for a school.
+    Teacher sees own students; school_admin and sub_admin see all.
+    Accepts optional filters: classGrade, source.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        body      = request.get_json(force=True, silent=True) or {}
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+
+        db = _get_db()
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s = sess.to_dict()
+        role       = s.get('role')
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+
+        q = db.collection('rds_students').where('schoolId', '==', school_id)
+
+        # Teachers only see students they registered
+        if role == 'teacher':
+            q = q.where('teacherId', '==', teacher_id)
+
+        # Optional filters
+        if body.get('classGrade'):
+            q = q.where('classGrade', '==', body['classGrade'])
+        if body.get('source'):
+            q = q.where('source', '==', body['source'])
+
+        docs = q.order_by('name').get()
+        students = []
+        for d in docs:
+            row = d.to_dict()
+            row['id'] = d.id
+            # Convert timestamps to ISO strings
+            for f in ('createdAt', 'updatedAt'):
+                if row.get(f) and hasattr(row[f], 'isoformat'):
+                    row[f] = row[f].isoformat()
+            students.append(row)
+
+        return _rds_json_resp({'ok': True, 'students': students, 'count': len(students)}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-students/sync-cbt', methods=['POST', 'OPTIONS'])
+def rds_students_sync_cbt():
+    """
+    Pull CBT students for this school into rds_students.
+    Only creates records that do not already exist (matched by email).
+    Returns counts: { created, skipped, total }.
+    Called by teacher — imports their school's CBT students into RDS.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s = sess.to_dict()
+        role       = s.get('role')
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+
+        if role not in ('teacher', 'school_admin', 'sub_admin', 'super_admin'):
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised'}, 403, request)
+
+        # Fetch all CBT students for this school
+        cbt_snap = db.collection('users')             .where('schoolId', '==', school_id)             .where('role', '==', 'student')             .get()
+
+        created = 0
+        skipped = 0
+
+        for doc in cbt_snap:
+            cbt = doc.to_dict()
+            email = doc.id  # CBT uses email as doc ID
+
+            # Check if already in rds_students
+            existing = db.collection('rds_students')                 .where('schoolId', '==', school_id)                 .where('email', '==', email)                 .limit(1).get()
+
+            if existing:
+                skipped += 1
+                continue
+
+            # Create rds_students record
+            db.collection('rds_students').add({
+                'schoolId':        school_id,
+                'teacherId':       teacher_id,
+                'name':            cbt.get('name', ''),
+                'email':           email,
+                'classGrade':      cbt.get('classGrade', ''),
+                'admissionNumber': '',
+                'parentEmail':     '',
+                'parentWhatsapp':  '',
+                'source':          'cbt',
+                'cbtSynced':       True,
+                'createdAt':       datetime.now(timezone.utc),
+                'updatedAt':       datetime.now(timezone.utc),
+                'createdBy':       teacher_id,
+            })
+            created += 1
+
+        return _rds_json_resp({
+            'ok':      True,
+            'created': created,
+            'skipped': skipped,
+            'total':   created + skipped,
+            'message': f'{created} student(s) imported, {skipped} already existed.',
+        }, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-students/add', methods=['POST', 'OPTIONS'])
+def rds_students_add():
+    """
+    Manually add a single student (non-CBT or additional details).
+    Required: name, classGrade
+    Optional: email, admissionNumber, parentEmail, parentWhatsapp
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s = sess.to_dict()
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+
+        body = request.get_json(force=True, silent=True) or {}
+        name       = (body.get('name') or '').strip()
+        class_grade = (body.get('classGrade') or '').strip()
+
+        if not name:
+            return _rds_json_resp({'ok': False, 'error': 'Student name is required.'}, 400, request)
+        if not class_grade:
+            return _rds_json_resp({'ok': False, 'error': 'Class/Grade is required.'}, 400, request)
+
+        email = (body.get('email') or '').strip().lower()
+
+        # Check for duplicate email within school
+        if email:
+            dup = db.collection('rds_students')                 .where('schoolId', '==', school_id)                 .where('email', '==', email)                 .limit(1).get()
+            if dup:
+                return _rds_json_resp({'ok': False, 'error': f'A student with email {email} already exists in this school.'}, 409, request)
+
+        ref, _ = db.collection('rds_students').add({
+            'schoolId':        school_id,
+            'teacherId':       teacher_id,
+            'name':            name,
+            'email':           email,
+            'classGrade':      class_grade,
+            'admissionNumber': (body.get('admissionNumber') or '').strip(),
+            'parentEmail':     (body.get('parentEmail') or '').strip().lower(),
+            'parentWhatsapp':  (body.get('parentWhatsapp') or '').strip(),
+            'source':          'manual',
+            'cbtSynced':       False,
+            'createdAt':       datetime.now(timezone.utc),
+            'updatedAt':       datetime.now(timezone.utc),
+            'createdBy':       teacher_id,
+        })
+
+        return _rds_json_resp({'ok': True, 'id': ref.id, 'message': f'Student "{name}" added successfully.'}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-students/update/<student_id>', methods=['POST', 'OPTIONS'])
+def rds_students_update(student_id):
+    """
+    Update parent contact details and other fields on an rds_student.
+    Teacher can update their own students.
+    school_admin / sub_admin can update any student in their school.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s = sess.to_dict()
+        role       = s.get('role')
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+
+        doc_ref = db.collection('rds_students').document(student_id)
+        doc     = doc_ref.get()
+        if not doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Student not found.'}, 404, request)
+
+        existing = doc.to_dict()
+        if existing.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+
+        # Teachers can only update their own students
+        if role == 'teacher' and existing.get('teacherId') != teacher_id:
+            return _rds_json_resp({'ok': False, 'error': 'You can only update students you registered.'}, 403, request)
+
+        body = request.get_json(force=True, silent=True) or {}
+
+        # Only allow updating safe fields
+        allowed = ('parentEmail', 'parentWhatsapp', 'admissionNumber', 'classGrade', 'name')
+        updates = {k: (body[k] or '').strip() for k in allowed if k in body}
+        updates['updatedAt'] = datetime.now(timezone.utc)
+
+        doc_ref.update(updates)
+        return _rds_json_resp({'ok': True, 'message': 'Student updated successfully.'}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-students/delete/<student_id>', methods=['POST', 'OPTIONS'])
+def rds_students_delete(student_id):
+    """Delete a manually-added student (cannot delete CBT-synced students)."""
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s = sess.to_dict()
+        role       = s.get('role')
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+
+        doc_ref = db.collection('rds_students').document(student_id)
+        doc     = doc_ref.get()
+        if not doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Student not found.'}, 404, request)
+
+        existing = doc.to_dict()
+        if existing.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+
+        if role == 'teacher' and existing.get('teacherId') != teacher_id:
+            return _rds_json_resp({'ok': False, 'error': 'You can only delete students you registered.'}, 403, request)
+
+        doc_ref.delete()
+        return _rds_json_resp({'ok': True, 'message': 'Student deleted.'}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-students/bulk-add', methods=['POST', 'OPTIONS'])
+def rds_students_bulk_add():
+    """
+    Bulk add non-CBT students from a JSON array.
+    Each item: { name, classGrade, admissionNumber?, parentEmail?, parentWhatsapp?, email? }
+    Returns { created, failed[] }
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s = sess.to_dict()
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+
+        body = request.get_json(force=True, silent=True) or {}
+        rows = body.get('students', [])
+
+        if not rows or not isinstance(rows, list):
+            return _rds_json_resp({'ok': False, 'error': 'No student data provided.'}, 400, request)
+
+        created = 0
+        failed  = []
+        batch   = db.batch()
+        count   = 0
+
+        for row in rows:
+            name        = (row.get('name') or '').strip()
+            class_grade = (row.get('classGrade') or '').strip()
+
+            if not name or not class_grade:
+                failed.append(f'Row skipped — name and classGrade are required: {row}')
+                continue
+
+            email = (row.get('email') or '').strip().lower()
+
+            # Duplicate check for email
+            if email:
+                dup = db.collection('rds_students')                     .where('schoolId', '==', school_id)                     .where('email', '==', email)                     .limit(1).get()
+                if dup:
+                    failed.append(f'{name} ({email}) — already exists')
+                    continue
+
+            ref = db.collection('rds_students').document()
+            batch.set(ref, {
+                'schoolId':        school_id,
+                'teacherId':       teacher_id,
+                'name':            name,
+                'email':           email,
+                'classGrade':      class_grade,
+                'admissionNumber': (row.get('admissionNumber') or '').strip(),
+                'parentEmail':     (row.get('parentEmail') or '').strip().lower(),
+                'parentWhatsapp':  (row.get('parentWhatsapp') or '').strip(),
+                'source':          'manual',
+                'cbtSynced':       False,
+                'createdAt':       datetime.now(timezone.utc),
+                'updatedAt':       datetime.now(timezone.utc),
+                'createdBy':       teacher_id,
+            })
+            created += 1
+            count   += 1
+
+            # Firestore batch limit is 500
+            if count == 499:
+                batch.commit()
+                batch  = db.batch()
+                count  = 0
+
+        if count > 0:
+            batch.commit()
+
+        return _rds_json_resp({
+            'ok':      True,
+            'created': created,
+            'failed':  failed,
+            'message': f'{created} student(s) added successfully.',
+        }, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-students/classes', methods=['POST', 'OPTIONS'])
+def rds_students_classes():
+    """Return distinct classGrade values for this school's rds_students."""
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        school_id = sess.to_dict().get('schoolId')
+
+        docs   = db.collection('rds_students').where('schoolId', '==', school_id).get()
+        grades = sorted(set(d.to_dict().get('classGrade', '') for d in docs if d.to_dict().get('classGrade')))
+
+        return _rds_json_resp({'ok': True, 'classes': grades}, req=request)
+
+    except Exception as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
 # ── Health check ──────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
