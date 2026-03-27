@@ -1920,6 +1920,654 @@ def rds_students_classes():
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
 
 
+
+# =============================================================================
+# RDS — Phase 2: Result File Creation & Management
+# Collections: rds_result_files, rds_result_entries
+# =============================================================================
+
+# ── Grading helpers ────────────────────────────────────────────────────────────
+
+def _compute_grade(total, max_score=100):
+    """Nigerian WAEC/NECO grading system."""
+    if max_score <= 0: return 'F9'
+    pct = (total / max_score) * 100
+    if pct >= 75: return 'A1'
+    if pct >= 70: return 'B2'
+    if pct >= 65: return 'B3'
+    if pct >= 60: return 'C4'
+    if pct >= 55: return 'C5'
+    if pct >= 50: return 'C6'
+    if pct >= 45: return 'D7'
+    if pct >= 40: return 'E8'
+    return 'F9'
+
+def _compute_remark(grade):
+    remarks = {
+        'A1': 'Excellent', 'B2': 'Very Good', 'B3': 'Good',
+        'C4': 'Credit', 'C5': 'Credit', 'C6': 'Credit',
+        'D7': 'Pass', 'E8': 'Pass', 'F9': 'Fail'
+    }
+    return remarks.get(grade, '—')
+
+def _compute_positions(entries):
+    """
+    Assign class positions based on totalScore descending.
+    Handles ties — students with equal totalScore share a position.
+    Returns dict: {entryId: position_string}
+    """
+    sorted_entries = sorted(entries, key=lambda e: e.get('totalScore', 0), reverse=True)
+    positions = {}
+    pos = 1
+    for i, entry in enumerate(sorted_entries):
+        if i > 0 and entry.get('totalScore', 0) < sorted_entries[i-1].get('totalScore', 0):
+            pos = i + 1
+        positions[entry['id']] = pos
+    return positions
+
+def _ordinal(n):
+    if 11 <= n % 100 <= 13:
+        return f'{n}th'
+    return f'{n}{["th","st","nd","rd","th","th","th","th","th","th"][n % 10]}'
+
+
+# ── Result File CRUD ───────────────────────────────────────────────────────────
+
+@app.route('/rds-result-files/create', methods=['POST', 'OPTIONS'])
+def rds_result_files_create():
+    """
+    Create a new result file (draft).
+    Required: session, term, classGrade, subject
+    Optional: cbtExamId (link to CBT exam for auto-pulling scores)
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s          = sess.to_dict()
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+        teacher_name = s.get('name', '')
+
+        body       = request.get_json(force=True, silent=True) or {}
+        session_yr = (body.get('session') or '').strip()
+        term       = (body.get('term') or '').strip()
+        class_grade= (body.get('classGrade') or '').strip()
+        subject    = (body.get('subject') or '').strip()
+        cbt_exam_id= (body.get('cbtExamId') or '').strip()
+
+        if not session_yr: return _rds_json_resp({'ok': False, 'error': 'Academic session is required.'}, 400, request)
+        if not term:       return _rds_json_resp({'ok': False, 'error': 'Term is required.'}, 400, request)
+        if not class_grade:return _rds_json_resp({'ok': False, 'error': 'Class/Grade is required.'}, 400, request)
+        if not subject:    return _rds_json_resp({'ok': False, 'error': 'Subject is required.'}, 400, request)
+
+        # Prevent duplicate — same teacher, school, session, term, class, subject
+        dup = db.collection('rds_result_files')             .where('schoolId',   '==', school_id)             .where('teacherId',  '==', teacher_id)             .where('session',    '==', session_yr)             .where('term',       '==', term)             .where('classGrade', '==', class_grade)             .where('subject',    '==', subject)             .limit(1).get()
+        if dup:
+            return _rds_json_resp({'ok': False, 'error': f'A result file for {subject} — {class_grade} — {term} {session_yr} already exists.'}, 409, request)
+
+        ref, _ = db.collection('rds_result_files').add({
+            'schoolId':        school_id,
+            'teacherId':       teacher_id,
+            'teacherName':     teacher_name,
+            'session':         session_yr,
+            'term':            term,
+            'classGrade':      class_grade,
+            'subject':         subject,
+            'cbtExamId':       cbt_exam_id,
+            'status':          'draft',
+            'totalStudents':   0,
+            'createdAt':       datetime.now(timezone.utc),
+            'updatedAt':       datetime.now(timezone.utc),
+            'submittedAt':     None,
+            'approvedAt':      None,
+            'approvedBy':      None,
+            'rejectedAt':      None,
+            'rejectedBy':      None,
+            'rejectionComment':None,
+            'distributedAt':   None,
+        })
+
+        return _rds_json_resp({'ok': True, 'fileId': ref.id,
+            'message': f'Result file created for {subject} — {class_grade}.'}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/list', methods=['POST', 'OPTIONS'])
+def rds_result_files_list():
+    """List result files — teachers see own, admins/coordinators see all school files."""
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s          = sess.to_dict()
+        role       = s.get('role')
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+
+        q = db.collection('rds_result_files').where('schoolId', '==', school_id)
+        if role == 'teacher':
+            q = q.where('teacherId', '==', teacher_id)
+
+        body = request.get_json(force=True, silent=True) or {}
+        if body.get('status'):
+            q = q.where('status', '==', body['status'])
+
+        docs  = q.order_by('createdAt', direction='DESCENDING').get()
+        files = []
+        for d in docs:
+            row = d.to_dict()
+            row['id'] = d.id
+            for f in ('createdAt', 'updatedAt', 'submittedAt', 'approvedAt',
+                      'rejectedAt', 'distributedAt'):
+                if row.get(f) and hasattr(row[f], 'isoformat'):
+                    row[f] = row[f].isoformat()
+            files.append(row)
+
+        return _rds_json_resp({'ok': True, 'files': files, 'count': len(files)}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/get/<file_id>', methods=['POST', 'OPTIONS'])
+def rds_result_files_get(file_id):
+    """Get a single result file with all its entries."""
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s         = sess.to_dict()
+        school_id = s.get('schoolId')
+
+        doc = db.collection('rds_result_files').document(file_id).get()
+        if not doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+
+        file_data = doc.to_dict()
+        if file_data.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+
+        file_data['id'] = doc.id
+        for f in ('createdAt', 'updatedAt', 'submittedAt', 'approvedAt',
+                  'rejectedAt', 'distributedAt'):
+            if file_data.get(f) and hasattr(file_data[f], 'isoformat'):
+                file_data[f] = file_data[f].isoformat()
+
+        # Fetch entries
+        entries_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        entries = []
+        for e in entries_snap:
+            row = e.to_dict()
+            row['id'] = e.id
+            for f in ('createdAt', 'updatedAt'):
+                if row.get(f) and hasattr(row[f], 'isoformat'):
+                    row[f] = row[f].isoformat()
+            entries.append(row)
+
+        # Sort by student name
+        entries.sort(key=lambda e: e.get('studentName', ''))
+
+        # Compute positions
+        positions = _compute_positions(entries)
+        for entry in entries:
+            entry['position'] = positions.get(entry['id'], '—')
+            entry['positionStr'] = _ordinal(entry['position']) if isinstance(entry['position'], int) else '—'
+
+        return _rds_json_resp({'ok': True, 'file': file_data, 'entries': entries}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/populate', methods=['POST', 'OPTIONS'])
+def rds_result_files_populate():
+    """
+    Populate a result file with students from rds_students (same classGrade).
+    For CBT students: auto-pull exam score from submissions if cbtExamId is set.
+    For manual students: create blank entries for teacher to fill.
+    Skips students already in this file.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s          = sess.to_dict()
+        school_id  = s.get('schoolId')
+        teacher_id = s.get('uid')
+
+        body    = request.get_json(force=True, silent=True) or {}
+        file_id = (body.get('fileId') or '').strip()
+        if not file_id:
+            return _rds_json_resp({'ok': False, 'error': 'fileId required.'}, 400, request)
+
+        # Get result file
+        file_doc = db.collection('rds_result_files').document(file_id).get()
+        if not file_doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+        fd = file_doc.to_dict()
+        if fd.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+        if fd.get('status') != 'draft':
+            return _rds_json_resp({'ok': False, 'error': 'Only draft files can be populated.'}, 400, request)
+
+        class_grade  = fd.get('classGrade', '')
+        cbt_exam_id  = fd.get('cbtExamId', '')
+
+        # Get students for this class
+        students_snap = db.collection('rds_students')             .where('schoolId',   '==', school_id)             .where('classGrade', '==', class_grade).get()
+
+        # Get existing entries to skip duplicates
+        existing_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        existing_student_ids = {e.to_dict().get('studentId') for e in existing_snap}
+
+        # Load CBT submissions for this exam if linked
+        cbt_scores = {}
+        if cbt_exam_id:
+            subs_snap = db.collection('submissions')                 .where('examId', '==', cbt_exam_id)                 .where('schoolId', '==', school_id).get()
+            for sub in subs_snap:
+                sd = sub.to_dict()
+                email = sd.get('studentEmail', '').lower()
+                if email:
+                    cbt_scores[email] = {
+                        'score':      sd.get('score', 0),
+                        'total':      sd.get('total', 0),
+                        'percentage': sd.get('percentage', 0),
+                    }
+
+        created = 0
+        skipped = 0
+        batch   = db.batch()
+        count   = 0
+
+        for student_doc in students_snap:
+            student_id = student_doc.id
+            sd         = student_doc.to_dict()
+
+            if student_id in existing_student_ids:
+                skipped += 1
+                continue
+
+            email  = (sd.get('email') or '').lower()
+            source = sd.get('source', 'manual')
+
+            # Pull CBT exam score if available
+            cbt_data    = cbt_scores.get(email, {}) if (source == 'cbt' and email) else {}
+            cbt_score   = cbt_data.get('score', None)
+            cbt_total   = cbt_data.get('total', None)
+            cbt_pct     = cbt_data.get('percentage', None)
+
+            # For CBT students: map CBT percentage to exam score out of 60
+            # e.g. 80% CBT score → 48/60 exam score
+            exam_score_from_cbt = None
+            if cbt_pct is not None:
+                exam_score_from_cbt = round((cbt_pct / 100) * 60, 1)
+
+            entry_ref = db.collection('rds_result_entries').document()
+            batch.set(entry_ref, {
+                'resultFileId':      file_id,
+                'schoolId':          school_id,
+                'studentId':         student_id,
+                'studentName':       sd.get('name', ''),
+                'classGrade':        class_grade,
+                'source':            source,
+                # CBT data (populated for CBT students)
+                'cbtScore':          cbt_score,
+                'cbtTotal':          cbt_total,
+                'cbtPercentage':     cbt_pct,
+                # Score fields (teacher fills in / pre-filled from CBT)
+                'testScore':         None,
+                'examScore':         exam_score_from_cbt,  # pre-fill from CBT or None
+                'caScore':           None,
+                # Computed (filled when teacher saves scores)
+                'totalScore':        None,
+                'grade':             None,
+                'remark':            None,
+                'position':          None,
+                'createdAt':         datetime.now(timezone.utc),
+                'updatedAt':         datetime.now(timezone.utc),
+            })
+            created += 1
+            count   += 1
+            if count == 499:
+                batch.commit()
+                batch  = db.batch()
+                count  = 0
+
+        if count > 0:
+            batch.commit()
+
+        # Update totalStudents on result file
+        total_now = len(existing_student_ids) + created
+        db.collection('rds_result_files').document(file_id).update({
+            'totalStudents': total_now,
+            'updatedAt':     datetime.now(timezone.utc),
+        })
+
+        return _rds_json_resp({
+            'ok':      True,
+            'created': created,
+            'skipped': skipped,
+            'total':   total_now,
+            'message': f'{created} student(s) added to result file.',
+        }, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-entries/save', methods=['POST', 'OPTIONS'])
+def rds_result_entries_save():
+    """
+    Save scores for one or more entries.
+    Accepts: { fileId, entries: [{id, testScore, examScore, caScore}, ...] }
+    Auto-computes totalScore, grade, remark.
+    Positions are recomputed across ALL entries for the file.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s         = sess.to_dict()
+        school_id = s.get('schoolId')
+
+        body    = request.get_json(force=True, silent=True) or {}
+        file_id = (body.get('fileId') or '').strip()
+        entries = body.get('entries', [])
+
+        if not file_id:
+            return _rds_json_resp({'ok': False, 'error': 'fileId required.'}, 400, request)
+
+        # Verify file belongs to school and is draft
+        file_doc = db.collection('rds_result_files').document(file_id).get()
+        if not file_doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+        fd = file_doc.to_dict()
+        if fd.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+        if fd.get('status') not in ('draft',):
+            return _rds_json_resp({'ok': False, 'error': 'Only draft files can be edited.'}, 400, request)
+
+        # Save each entry
+        batch = db.batch()
+        count = 0
+
+        for row in entries:
+            entry_id  = (row.get('id') or '').strip()
+            if not entry_id: continue
+
+            test_score = row.get('testScore')
+            exam_score = row.get('examScore')
+            ca_score   = row.get('caScore')
+
+            # Convert to float, treat empty/None as None
+            def to_num(v):
+                try: return float(v) if v is not None and str(v).strip() != '' else None
+                except: return None
+
+            test  = to_num(test_score)
+            exam  = to_num(exam_score)
+            ca    = to_num(ca_score)
+
+            # Compute total — only if all three are present
+            total = None
+            grade = None
+            remark = None
+            if test is not None and exam is not None and ca is not None:
+                total  = round(test + exam + ca, 1)
+                max_sc = 130  # 40 + 60 + 30
+                grade  = _compute_grade(total, max_sc)
+                remark = _compute_remark(grade)
+
+            update = {
+                'testScore': test,
+                'examScore': exam,
+                'caScore':   ca,
+                'totalScore':total,
+                'grade':     grade,
+                'remark':    remark,
+                'updatedAt': datetime.now(timezone.utc),
+            }
+            ref = db.collection('rds_result_entries').document(entry_id)
+            batch.update(ref, update)
+            count += 1
+
+            if count == 499:
+                batch.commit()
+                batch = db.batch()
+                count = 0
+
+        if count > 0:
+            batch.commit()
+
+        # Recompute positions across ALL entries in this file
+        all_entries_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        all_entries = []
+        for e in all_entries_snap:
+            row = e.to_dict()
+            row['id'] = e.id
+            all_entries.append(row)
+
+        positions = _compute_positions([e for e in all_entries if e.get('totalScore') is not None])
+        pos_batch = db.batch()
+        pos_count = 0
+        for entry in all_entries:
+            pos = positions.get(entry['id'])
+            if pos is not None:
+                ref = db.collection('rds_result_entries').document(entry['id'])
+                pos_batch.update(ref, {'position': pos})
+                pos_count += 1
+                if pos_count == 499:
+                    pos_batch.commit()
+                    pos_batch = db.batch()
+                    pos_count = 0
+        if pos_count > 0:
+            pos_batch.commit()
+
+        # Update file updatedAt
+        db.collection('rds_result_files').document(file_id).update({
+            'updatedAt': datetime.now(timezone.utc)
+        })
+
+        return _rds_json_resp({'ok': True, 'saved': len(entries),
+            'message': 'Scores saved successfully.'}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/submit/<file_id>', methods=['POST', 'OPTIONS'])
+def rds_result_files_submit(file_id):
+    """
+    Teacher submits a result file for coordinator/admin review.
+    Validates all entries have complete scores before allowing submission.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s         = sess.to_dict()
+        school_id = s.get('schoolId')
+        role      = s.get('role')
+
+        file_doc = db.collection('rds_result_files').document(file_id).get()
+        if not file_doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+        fd = file_doc.to_dict()
+        if fd.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+        if fd.get('status') != 'draft':
+            return _rds_json_resp({'ok': False, 'error': 'Only draft files can be submitted.'}, 400, request)
+
+        # Check all entries are complete
+        entries_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        entries = [e.to_dict() for e in entries_snap]
+
+        if not entries:
+            return _rds_json_resp({'ok': False,
+                'error': 'No students in this result file. Please populate it first.'}, 400, request)
+
+        incomplete = [e.get('studentName', '?') for e in entries
+                      if e.get('totalScore') is None]
+        if incomplete:
+            return _rds_json_resp({'ok': False,
+                'error': f'{len(incomplete)} student(s) have incomplete scores: {", ".join(incomplete[:5])}{"..." if len(incomplete) > 5 else ""}.'}, 400, request)
+
+        db.collection('rds_result_files').document(file_id).update({
+            'status':      'submitted',
+            'submittedAt': datetime.now(timezone.utc),
+            'updatedAt':   datetime.now(timezone.utc),
+        })
+
+        return _rds_json_resp({'ok': True,
+            'message': 'Result file submitted for review.'}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/delete/<file_id>', methods=['POST', 'OPTIONS'])
+def rds_result_files_delete(file_id):
+    """Delete a draft result file and all its entries."""
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        s         = sess.to_dict()
+        school_id = s.get('schoolId')
+        role      = s.get('role')
+        uid       = s.get('uid')
+
+        file_doc = db.collection('rds_result_files').document(file_id).get()
+        if not file_doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+        fd = file_doc.to_dict()
+        if fd.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+        if fd.get('status') != 'draft':
+            return _rds_json_resp({'ok': False, 'error': 'Only draft files can be deleted.'}, 400, request)
+        if role == 'teacher' and fd.get('teacherId') != uid:
+            return _rds_json_resp({'ok': False, 'error': 'You can only delete your own result files.'}, 403, request)
+
+        # Delete all entries first
+        entries_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        batch = db.batch()
+        count = 0
+        for e in entries_snap:
+            batch.delete(e.reference)
+            count += 1
+            if count == 499:
+                batch.commit()
+                batch = db.batch()
+                count = 0
+        if count > 0:
+            batch.commit()
+
+        # Delete the file
+        db.collection('rds_result_files').document(file_id).delete()
+
+        return _rds_json_resp({'ok': True, 'message': 'Result file deleted.'}, req=request)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/cbt-exams', methods=['POST', 'OPTIONS'])
+def rds_cbt_exams_for_class():
+    """
+    Return list of CBT exams for a given classGrade in this school.
+    Used in result file creation — teacher picks which CBT exam to link.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+        db = _get_db()
+
+        sess = db.collection('rds_sessions').document(session_id).get()
+        if not sess.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
+        school_id = sess.to_dict().get('schoolId')
+
+        body        = request.get_json(force=True, silent=True) or {}
+        class_grade = (body.get('classGrade') or '').strip()
+
+        q = db.collection('exams').where('schoolId', '==', school_id)
+        if class_grade:
+            q = q.where('targetClass', '==', class_grade)
+
+        exams_snap = q.get()
+        exams = []
+        for e in exams_snap:
+            ed = e.to_dict()
+            exams.append({
+                'id':          e.id,
+                'title':       ed.get('title', ''),
+                'targetClass': ed.get('targetClass', ''),
+                'examTerm':    ed.get('examTerm', ''),
+                'examType':    ed.get('examType', ''),
+                'subject':     ed.get('subject', ed.get('title', '')),
+            })
+        exams.sort(key=lambda e: e['title'])
+
+        return _rds_json_resp({'ok': True, 'exams': exams}, req=request)
+
+    except Exception as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
 # ── Health check ──────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
