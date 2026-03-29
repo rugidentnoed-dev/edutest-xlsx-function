@@ -4,11 +4,17 @@ import json
 import sys
 import traceback
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from openpyxl import Workbook
 from openpyxl.styles import Protection, Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from flask import Flask, request as flask_request, make_response
+
+import hmac
+import hashlib
+import base64
+import uuid
+
 app = Flask(__name__)
 
 # ── Firebase Admin SDK ────────────────────────────────────────────────────────
@@ -27,43 +33,58 @@ def _get_db():
         if sa_json:
             try:
                 sa_dict = json.loads(sa_json)
-            except json.JSONDecodeError as je:
-                sa_json_fixed = sa_json.replace('\r\n', '\n')
-                sa_dict = json.loads(sa_json_fixed)
-            # Repair private_key if actual newlines were injected
+            except json.JSONDecodeError:
+                sa_dict = json.loads(sa_json.replace('\r\n', '\n'))
             if 'private_key' in sa_dict:
                 pk = sa_dict['private_key']
                 if '\\n' in pk:
                     sa_dict['private_key'] = pk.replace('\\n', '\n')
             try:
                 cred = credentials.Certificate(sa_dict)
-            except Exception as ce:
+            except Exception:
                 traceback.print_exc()
                 raise
         else:
             cred = credentials.Certificate('serviceAccountKey.json')
         try:
             firebase_admin.initialize_app(cred)
-        except Exception as ie:
+        except Exception:
             traceback.print_exc()
             raise
     try:
         _fdb = admin_firestore.client()
         return _fdb
-    except Exception as fe:
+    except Exception:
         traceback.print_exc()
         raise
+
+
+# ── Environment / constants ───────────────────────────────────────────────────
 PROTECT_PASSWORD = os.environ.get('XLSX_PASSWORD', 'EduTestPro2025')
-# Only accept requests from the Firebase hosting domain.
-# OPTIONS preflight still works (browser sends Origin header automatically).
-ALLOWED_ORIGINS = {
+
+# RDS_URL: custom domain (set in Render env vars)
+RDS_URL = os.environ.get('RDS_URL', 'https://rds.edutest-pro.online')
+
+# All allowed CORS origins — CBT and RDS, both custom and Firebase Hosting domains
+ALLOWED_CBT_ORIGINS = {
+    'https://edutest-pro.online',
     'https://edutest-pro-cbt.web.app',
     'https://edutest-pro-cbt.firebaseapp.com',
 }
 
+ALLOWED_RDS_ORIGINS = {
+    'https://rds.edutest-pro.online',
+    'https://edutest-rds.web.app',
+    'https://edutest-rds.firebaseapp.com',
+}
+
+ALL_ALLOWED_ORIGINS = ALLOWED_CBT_ORIGINS | ALLOWED_RDS_ORIGINS
+
+
 def _cors_headers(req=None):
+    """CORS headers for CBT-only endpoints."""
     origin = (req.headers.get('Origin', '') if req else '') or ''
-    allowed = origin if origin in ALLOWED_ORIGINS else 'https://edutest-pro-cbt.web.app'
+    allowed = origin if origin in ALLOWED_CBT_ORIGINS else 'https://edutest-pro.online'
     return {
         'Access-Control-Allow-Origin':  allowed,
         'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -71,18 +92,38 @@ def _cors_headers(req=None):
         'Vary': 'Origin',
     }
 
+
+def _make_rds_cors(req=None):
+    """CORS headers for RDS endpoints — allows both CBT and RDS origins."""
+    origin = (req.headers.get('Origin', '') if req else '') or ''
+    is_firebase = (
+        origin.endswith('.web.app') or
+        origin.endswith('.firebaseapp.com')
+    )
+    if origin in ALL_ALLOWED_ORIGINS or is_firebase:
+        allowed = origin
+    else:
+        allowed = RDS_URL.rstrip('/')
+    return {
+        'Access-Control-Allow-Origin':      allowed,
+        'Access-Control-Allow-Methods':     'POST, GET, OPTIONS',
+        'Access-Control-Allow-Headers':     'Content-Type, Authorization, X-EduTest-Key',
+        'Access-Control-Allow-Credentials': 'false',
+        'Vary': 'Origin',
+    }
+
 CORS = _cors_headers()
 
+
 # ── Style constants ────────────────────────────────────────────────────────────
-_GREEN      = '1B6B45'   # dark professional green
-_GREEN_LIGHT= '2D9B6A'   # lighter green for sub-headers
-_DARK       = '1A1A2E'
-_GREY       = '6B7280'
-_WHITE      = 'FFFFFF'
-_PASS_CLR   = '059669'
-_FAIL_CLR   = 'DC2626'
-_ALT_BG     = 'F0FDF4'   # very light green tint for alternating rows
-_HDR_BG     = 'E8F5E9'   # column header bg
+_GREEN       = '1B6B45'
+_GREEN_LIGHT = '2D9B6A'
+_DARK        = '1A1A2E'
+_GREY        = '6B7280'
+_WHITE       = 'FFFFFF'
+_PASS_CLR    = '059669'
+_FAIL_CLR    = 'DC2626'
+_ALT_BG      = 'F0FDF4'
 
 _TITLE_FILL   = PatternFill('solid', fgColor=_GREEN)
 _SUB_FILL     = PatternFill('solid', fgColor=_GREEN_LIGHT)
@@ -93,23 +134,20 @@ _LOCK         = Protection(locked=True)
 def _font(size=10, bold=False, color=_DARK, name='Calibri'):
     return Font(name=name, size=size, bold=bold, color=color)
 
-_CENTER  = Alignment(horizontal='center', vertical='center', wrap_text=False)
-_LEFT    = Alignment(horizontal='left',   vertical='center')
-_THIN    = Side(style='thin',   color='D1FAE5')
-_MED     = Side(style='medium', color='059669')
-_BORDER  = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_CENTER = Alignment(horizontal='center', vertical='center', wrap_text=False)
+_LEFT   = Alignment(horizontal='left',   vertical='center')
+_THIN   = Side(style='thin',   color='D1FAE5')
+_MED    = Side(style='medium', color='059669')
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 
-NUM_COLS = 9   # #, Name, Email, Class, Arm, Score, %, Result, Date
+NUM_COLS = 9  # #, Name, Email, Class, Arm, Score, %, Result, Date
 
 
-
-# =============================================================================
-# EXAM ENDPOINTS  (server-side delivery + grading via Firebase Admin SDK)
-# =============================================================================
+# ── Shared helpers ─────────────────────────────────────────────────────────────
 
 def _verify_token(request):
     """Verify Firebase ID token. Returns (email, uid) or raises."""
-    _get_db()  # Ensure Firebase Admin is initialized before using fb_auth
+    _get_db()
     hdr = request.headers.get('Authorization', '')
     if not hdr.startswith('Bearer '):
         raise PermissionError('Missing or invalid Authorization header')
@@ -132,7 +170,6 @@ def _json_resp(data, status=200, req=None):
 
 
 def _rds_json_resp(data, status=200, req=None):
-    """Like _json_resp but uses _make_rds_cors to allow RDS frontend origin."""
     resp = make_response(json.dumps(data), status)
     resp.headers['Content-Type'] = 'application/json'
     for k, v in _make_rds_cors(req).items():
@@ -144,15 +181,41 @@ def _err(msg, status=400, req=None):
     return _json_resp({'ok': False, 'error': msg}, status, req)
 
 
-@app.route('/get-exam', methods=['POST','OPTIONS'])
+def _rds_session(request, db):
+    """
+    Validate RDS session from Authorization header.
+    Returns session dict or raises PermissionError.
+    """
+    session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
+    if not session_id:
+        raise PermissionError('No session provided')
+    snap = db.collection('rds_sessions').document(session_id).get()
+    if not snap.exists:
+        raise PermissionError('Invalid session')
+    sess = snap.to_dict()
+    expires_at = sess.get('expiresAt')
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+    if expires_at and datetime.now(timezone.utc) > expires_at:
+        db.collection('rds_sessions').document(session_id).delete()
+        raise PermissionError('Session expired')
+    return sess
+
+
+def _ts(dt_field):
+    """Convert Firestore timestamp or datetime to ISO string."""
+    if dt_field and hasattr(dt_field, 'isoformat'):
+        return dt_field.isoformat()
+    return dt_field
+
+
+# =============================================================================
+# EXAM ENDPOINTS
+# =============================================================================
+
+@app.route('/get-exam', methods=['POST', 'OPTIONS'])
 def get_exam():
     request = flask_request
-    """
-    POST /get-exam
-    Body: { examId }
-    Auth: Bearer <Firebase ID token>
-    Returns exam stripped of correctIndex / correctLetter.
-    """
     if request.method == 'OPTIONS':
         return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
@@ -160,15 +223,13 @@ def get_exam():
     try:
         _secret_ok(request)
         email, _ = _verify_token(request)
-        body    = request.get_json(force=True, silent=True) or {}
-        exam_id = (body.get('examId') or '').strip()
+        body     = request.get_json(force=True, silent=True) or {}
+        exam_id  = (body.get('examId') or '').strip()
         if not exam_id:
             return _err('examId required')
 
         db = _get_db()
-
-        # Verify student is active
-        u = db.collection('users').document(email).get()
+        u  = db.collection('users').document(email).get()
         if not u.exists:
             return _err('Account not found', 403)
         ud = u.to_dict()
@@ -177,17 +238,14 @@ def get_exam():
         if ud.get('role') != 'student':
             return _err('Only students can take exams', 403)
 
-        # Fetch full exam (Admin SDK bypasses client rules entirely)
         ex = db.collection('exams').document(exam_id).get()
         if not ex.exists:
             return _err('Exam not found', 404)
         ed = ex.to_dict()
 
-        # School isolation check
         if ed.get('schoolId') and ed['schoolId'] != ud.get('schoolId'):
             return _err('Exam not available for your school', 403)
 
-        # Strip correct answers before sending to browser
         safe_qs = [
             {'question': q.get('question', ''), 'options': q.get('options', [])}
             for q in ed.get('questions', [])
@@ -208,14 +266,9 @@ def get_exam():
         return _err(str(e), 500)
 
 
-@app.route('/check-submitted', methods=['POST','OPTIONS'])
+@app.route('/check-submitted', methods=['POST', 'OPTIONS'])
 def check_submitted():
     request = flask_request
-    """
-    POST /check-submitted
-    Body: { examId }
-    Returns { ok, submitted }
-    """
     if request.method == 'OPTIONS':
         return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
@@ -235,30 +288,16 @@ def check_submitted():
         return _err(str(e), 500)
 
 
-@app.route('/submit-exam', methods=['POST','OPTIONS'])
+@app.route('/submit-exam', methods=['POST', 'OPTIONS'])
 def submit_exam():
     request = flask_request
-    """
-    POST /submit-exam
-    Body: {
-        examId, rawAnswers, questionOrder, optionOrders, timeTaken
-    }
-    rawAnswers: { "shuffledQIdx": shuffledOptIdx, ... }
-    questionOrder: [origIdx, ...]          (from _questionOrder)
-    optionOrders:  [[origOptIdx,...], ...] (from _optionOrders)
-    timeTaken: seconds elapsed
-
-    Server grades against correctIndex from Firestore — browser never sees it.
-    Writes submission to Firestore via Admin SDK (bypasses client rules).
-    Returns { ok, correct, wrong, unanswered, total, percentage }
-    """
     if request.method == 'OPTIONS':
         return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
         return _err('Method not allowed', 405)
     try:
         _secret_ok(request)
-        email, _ = _verify_token(request)
+        email, _      = _verify_token(request)
         body          = request.get_json(force=True, silent=True) or {}
         exam_id       = (body.get('examId') or '').strip()
         raw_answers   = body.get('rawAnswers', {})
@@ -268,8 +307,6 @@ def submit_exam():
 
         if not exam_id:
             return _err('examId required')
-
-        # ── S4: Payload size guards ───────────────────────────────────────────
         if not isinstance(raw_answers, dict) or len(raw_answers) > 500:
             return _err('Invalid or oversized answer payload', 400)
         if not isinstance(question_order, list) or len(question_order) > 500:
@@ -278,8 +315,6 @@ def submit_exam():
             return _err('Invalid optionOrders', 400)
 
         db = _get_db()
-
-        # Verify student
         u  = db.collection('users').document(email).get()
         if not u.exists:
             return _err('Account not found', 403)
@@ -287,12 +322,10 @@ def submit_exam():
         if ud.get('status') != 'active' or ud.get('role') != 'student':
             return _err('Not authorised', 403)
 
-        # Prevent double submission
         doc_id = exam_id + '_' + email
         if db.collection('submissions').document(doc_id).get().exists:
             return _err('You have already submitted this exam.', 409)
 
-        # Fetch FULL exam with correct answers
         ex = db.collection('exams').document(exam_id).get()
         if not ex.exists:
             return _err('Exam not found', 404)
@@ -301,7 +334,6 @@ def submit_exam():
         if ed.get('schoolId') and ed['schoolId'] != ud.get('schoolId'):
             return _err('Exam not available for your school', 403)
 
-        # Block expired exams
         close_date_str = ed.get('closeDate')
         if close_date_str:
             try:
@@ -314,24 +346,17 @@ def submit_exam():
         orig_qs = ed.get('questions', [])
         total   = len(orig_qs)
 
-        # ── S3: Server-side timer validation ─────────────────────────────────
-        # Allow a 60-second grace period for network latency on top of duration.
-        # time_taken is in seconds; duration_minutes is in minutes.
         duration_minutes = ed.get('duration_minutes', 0)
         if duration_minutes and time_taken > 0:
-            max_allowed_secs = duration_minutes * 60 + 60  # +60s grace
+            max_allowed_secs = duration_minutes * 60 + 60
             if time_taken > max_allowed_secs:
-                # Cap it — don't reject, just record the real maximum.
-                # Rejecting could punish students with slow connections.
                 time_taken = max_allowed_secs
 
-        # Fallback if shuffle orders not sent
         if not question_order:
             question_order = list(range(total))
         if not option_orders:
             option_orders = [list(range(len(q.get('options', [])))) for q in orig_qs]
 
-        # ── Grade server-side ────────────────────────────────────────────────
         correct  = 0
         answered = 0
         audit    = {}
@@ -368,7 +393,6 @@ def submit_exam():
         unanswered = total - answered
         percentage = round(correct / total * 100) if total else 0
 
-        # ── Write to Firestore via Admin SDK ─────────────────────────────────
         db.collection('submissions').document(doc_id).set({
             'examId':       exam_id,
             'examTitle':    ed.get('title', ''),
@@ -394,21 +418,13 @@ def submit_exam():
     except PermissionError as e:
         return _err(str(e), 403)
     except Exception as e:
-        import traceback
         traceback.print_exc()
         return _err(str(e), 500)
 
 
-@app.route('/list-exams', methods=['POST','OPTIONS'])
+@app.route('/list-exams', methods=['POST', 'OPTIONS'])
 def list_exams():
     request = flask_request
-    """
-    POST /list-exams
-    Body: {} (no body needed — student identity from token)
-    Auth: Bearer <Firebase ID token>
-    Returns all active exams for the student's school, minus ones
-    they have already submitted.  No questions or correct answers included.
-    """
     if request.method == 'OPTIONS':
         return make_response('', 204, _cors_headers(request))
     if request.method != 'POST':
@@ -416,10 +432,8 @@ def list_exams():
     try:
         _secret_ok(request)
         email, _ = _verify_token(request)
-
         db = _get_db()
 
-        # Verify student
         u = db.collection('users').document(email).get()
         if not u.exists:
             return _err('Account not found', 403)
@@ -433,11 +447,11 @@ def list_exams():
         if not school_id:
             return _err('No school assigned to this account', 403)
 
-        # Fetch all exams for this school (Admin SDK — bypasses client rules)
         exams_snap = db.collection('exams').where('schoolId', '==', school_id).get()
-
-        # Fetch this student's submissions to exclude already-done exams
-        subs_snap = db.collection('submissions')             .where('studentEmail', '==', email.lower())             .where('schoolId',     '==', school_id)             .get()
+        subs_snap  = (db.collection('submissions')
+                       .where('studentEmail', '==', email.lower())
+                       .where('schoolId',     '==', school_id)
+                       .get())
         submitted_ids = {s.to_dict().get('examId') for s in subs_snap}
 
         now       = datetime.now(timezone.utc)
@@ -446,15 +460,14 @@ def list_exams():
             ed = ex.to_dict()
             if ex.id in submitted_ids:
                 continue
-            # Skip expired exams — closeDate is an ISO string stored by the client
             close_date_str = ed.get('closeDate')
             if close_date_str:
                 try:
                     close_dt = datetime.fromisoformat(close_date_str.replace('Z', '+00:00'))
                     if now > close_dt:
-                        continue  # exam has expired — hide from student
+                        continue
                 except Exception:
-                    pass  # malformed date — show the exam anyway
+                    pass
             exams_out.append({
                 'id':               ex.id,
                 'title':            ed.get('title', ''),
@@ -467,9 +480,7 @@ def list_exams():
                 'closeDate':        close_date_str or None,
             })
 
-        # Sort by creation time if available (newest first)
         exams_out.sort(key=lambda e: e['title'])
-
         return _json_resp({'ok': True, 'exams': exams_out})
 
     except PermissionError as e:
@@ -480,7 +491,11 @@ def list_exams():
         return _err(str(e), 500)
 
 
-@app.route('/generate_results_xlsx', methods=['POST','OPTIONS'])
+# =============================================================================
+# XLSX ENDPOINTS
+# =============================================================================
+
+@app.route('/generate_results_xlsx', methods=['POST', 'OPTIONS'])
 def generate_results_xlsx():
     request = flask_request
     if request.method == 'OPTIONS':
@@ -488,24 +503,19 @@ def generate_results_xlsx():
     if request.method != 'POST':
         return ('Method not allowed', 405, CORS)
 
-    # ── Auth: secret key + Firebase token + staff role ─────────────────────
     api_secret = os.environ.get('XLSX_SECRET', '')
-    if api_secret:
-        provided = request.headers.get('X-EduTest-Key', '')
-        if provided != api_secret:
-            return ('Unauthorized', 401, CORS)
+    if api_secret and request.headers.get('X-EduTest-Key', '') != api_secret:
+        return ('Unauthorized', 401, CORS)
     try:
         caller_email, _ = _verify_token(request)
     except PermissionError as e:
         return _err(str(e), 401)
 
-    # Verify caller is staff (not a student)
     db = _get_db()
     caller_doc = db.collection('users').document(caller_email).get()
     if not caller_doc.exists:
         return _err('Account not found', 403)
-    caller_data = caller_doc.to_dict()
-    if caller_data.get('role') not in ('super_admin', 'school_admin', 'sub_admin', 'teacher'):
+    if caller_doc.to_dict().get('role') not in ('super_admin', 'school_admin', 'sub_admin', 'teacher'):
         return _err('Not authorised', 403)
 
     body             = request.get_json(force=True, silent=True) or {}
@@ -522,8 +532,7 @@ def generate_results_xlsx():
     filename = f"{safe}.xlsx"
 
     resp = make_response(data)
-    resp.headers['Content-Type']        = (
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    resp.headers['Content-Type']        = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     resp.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
     for k, v in CORS.items():
         resp.headers[k] = v
@@ -565,42 +574,31 @@ def _build_xlsx(title, school, academic_session, term, exam_type, downloaded_by,
     wb = Workbook()
     ws = wb.active
     ws.title        = 'Results'
-    ws.freeze_panes = 'A6'   # freeze above the column-header row
+    ws.freeze_panes = 'A6'
 
-    # ── Header block ──────────────────────────────────────────────────────────
-    # Row 1 — School name (full width, large)
     _merged(ws, 1, 1, NUM_COLS,
             school.upper() if school else 'SCHOOL RESULTS',
-            _TITLE_FILL,
-            _font(14, True, _WHITE, 'Calibri'))
+            _TITLE_FILL, _font(14, True, _WHITE, 'Calibri'))
     ws.row_dimensions[1].height = 32
 
-    # Row 2 — Academic Session  |  Term  |  Exam Type  (split into 3 sections)
-    # Section 1: Academic Session (cols 1-3)
     _merged(ws, 2, 1, 3,
             f'Academic Session: {academic_session}' if academic_session else 'Academic Session: —',
             _SUB_FILL, _font(10, True, _WHITE))
-    # Section 2: Term (cols 4-6)
     _merged(ws, 2, 4, 6,
             f'Term: {term}' if term else 'Term: —',
             _SUB_FILL, _font(10, True, _WHITE))
-    # Section 3: Exam Type (cols 7-9)
     _merged(ws, 2, 7, NUM_COLS,
             f'Type: {exam_type}' if exam_type else 'Type: —',
             _SUB_FILL, _font(10, True, _WHITE))
     ws.row_dimensions[2].height = 22
 
-    # Row 3 — Report / exam title (full width)
     _merged(ws, 3, 1, NUM_COLS,
             title,
             PatternFill('solid', fgColor='F0FDF4'),
             _font(12, True, _GREEN))
     ws.row_dimensions[3].height = 24
-
-    # Row 4 — Stats bar (filled after we know totals)
     ws.row_dimensions[4].height = 18
 
-    # Row 5 — Column headers
     headers = ['#', 'Full Name', 'Email Address', 'Class', 'Arm',
                'Score', 'Percentage', 'Result', 'Date Submitted']
     for col, h in enumerate(headers, 1):
@@ -614,16 +612,14 @@ def _build_xlsx(title, school, academic_session, term, exam_type, downloaded_by,
             bottom=Side(style='medium', color=_WHITE))
     ws.row_dimensions[5].height = 22
 
-    # ── Data rows ─────────────────────────────────────────────────────────────
     pass_count = 0
     pct_total  = 0
 
     for i, row in enumerate(rows):
-        r       = i + 6
-        pct     = int(row.get('percentage', 0))
-        rslt    = 'PASS' if pct >= 50 else 'FAIL'
-        alt     = (i % 2 == 0)
-        bg_fill = _ALT_FILL if alt else PatternFill()
+        r    = i + 6
+        pct  = int(row.get('percentage', 0))
+        rslt = 'PASS' if pct >= 50 else 'FAIL'
+        alt  = (i % 2 == 0)
         if rslt == 'PASS': pass_count += 1
         pct_total += pct
 
@@ -651,29 +647,24 @@ def _build_xlsx(title, school, academic_session, term, exam_type, downloaded_by,
             c           = ws.cell(row=r, column=col, value=val)
             c.alignment = aln
             c.border    = _BORDER
-            c.font      = _font(9 if col in (3,9) else 10, bld, clr)
+            c.font      = _font(9 if col in (3, 9) else 10, bld, clr)
             if alt:
                 c.fill = _ALT_FILL
         ws.row_dimensions[r].height = 18
 
-    # ── Row 4: Stats bar ──────────────────────────────────────────────────────
     total      = len(rows)
     avg        = round(pct_total / total) if total else 0
     fail_count = total - pass_count
     pass_rate  = round(pass_count / total * 100) if total else 0
 
-    stats = [
+    stats     = [
         ('Total', str(total)),
         ('Passed', str(pass_count)),
         ('Failed', str(fail_count)),
         ('Average', f'{avg}%'),
         ('Pass Rate', f'{pass_rate}%'),
     ]
-    stat_fill  = PatternFill('solid', fgColor='DCFCE7')
-    stat_cols  = [1, 2, 4, 6, 8]   # label columns
-    val_cols   = [2, 3, 5, 7, 9]   # won't be used; labels are merged
-
-    # Write stats as label: value pairs across the row
+    stat_fill = PatternFill('solid', fgColor='DCFCE7')
     for idx, (lbl, val) in enumerate(stats):
         lc = idx * 2 + 1
         if lc + 1 > NUM_COLS:
@@ -683,39 +674,34 @@ def _build_xlsx(title, school, academic_session, term, exam_type, downloaded_by,
         l_cell.alignment = _CENTER
         l_cell.fill      = stat_fill
 
-    # ── Column widths ─────────────────────────────────────────────────────────
     widths = [5, 28, 32, 10, 6, 10, 13, 10, 22]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    # ── Lock sheet ────────────────────────────────────────────────────────────
     _lock_all(ws)
 
-    # ── Info sheet ────────────────────────────────────────────────────────────
-    ws2       = wb.create_sheet('Info')
-    now_str   = datetime.now(timezone.utc).strftime('%d %b %Y  %H:%M UTC')
+    ws2     = wb.create_sheet('Info')
+    now_str = datetime.now(timezone.utc).strftime('%d %b %Y  %H:%M UTC')
     info_rows = [
-        ('EduTest Pro — Results Export',    ''),
-        ('',                                ''),
-        ('School',                          school),
-        ('Academic Session',                academic_session or '—'),
-        ('Term',                            term             or '—'),
-        ('Exam Type',                       exam_type        or '—'),
-        ('Report Title',                    title),
-        ('Downloaded By',                   downloaded_by),
-        ('Download Date',                   now_str),
-        ('Total Records',                   total),
-        ('',                                ''),
-        ('Protection Note',
-         'This file is read-only and protected by EduTest Pro.'),
-        ('Unlock Password',
-         'Contact your system administrator for the password.'),
+        ('EduTest Pro — Results Export', ''),
+        ('', ''),
+        ('School',           school),
+        ('Academic Session', academic_session or '—'),
+        ('Term',             term             or '—'),
+        ('Exam Type',        exam_type        or '—'),
+        ('Report Title',     title),
+        ('Downloaded By',    downloaded_by),
+        ('Download Date',    now_str),
+        ('Total Records',    total),
+        ('', ''),
+        ('Protection Note',  'This file is read-only and protected by EduTest Pro.'),
+        ('Unlock Password',  'Contact your system administrator for the password.'),
     ]
     for r, (k, v) in enumerate(info_rows, 1):
-        ck       = ws2.cell(row=r, column=1, value=k)
-        cv       = ws2.cell(row=r, column=2, value=v)
-        ck.font  = _font(10, True,  _GREY)
-        cv.font  = _font(10, False, _DARK)
+        ck = ws2.cell(row=r, column=1, value=k)
+        cv = ws2.cell(row=r, column=2, value=v)
+        ck.font = _font(10, True,  _GREY)
+        cv.font = _font(10, False, _DARK)
         if r == 1:
             cv.value = ''
             ws2.merge_cells('A1:B1')
@@ -729,20 +715,14 @@ def _build_xlsx(title, school, academic_session, term, exam_type, downloaded_by,
     return buf.getvalue()
 
 
-
 # =============================================================================
 # ANSWER AUDIT ENDPOINT
-# =============================================================================
-# Per-student layout:
-#   Global header (school / session / term / type / title / warning)
-#   For each student:
-#     ├─ Name, email, class, exam, score banner
-#     └─ Table: Q# | Question Text | Option Picked | Correct Answer | Correct?
 # =============================================================================
 
 AUDIT_NCOLS = 5
 
-@app.route('/generate_audit_xlsx', methods=['POST','OPTIONS'])
+
+@app.route('/generate_audit_xlsx', methods=['POST', 'OPTIONS'])
 def generate_audit_xlsx():
     request = flask_request
     if request.method == 'OPTIONS':
@@ -750,24 +730,19 @@ def generate_audit_xlsx():
     if request.method != 'POST':
         return ('Method not allowed', 405, CORS)
 
-    # ── Auth: secret key + Firebase token + staff role ─────────────────────
     api_secret = os.environ.get('XLSX_SECRET', '')
-    if api_secret:
-        provided = request.headers.get('X-EduTest-Key', '')
-        if provided != api_secret:
-            return ('Unauthorized', 401, CORS)
+    if api_secret and request.headers.get('X-EduTest-Key', '') != api_secret:
+        return ('Unauthorized', 401, CORS)
     try:
         caller_email, _ = _verify_token(request)
     except PermissionError as e:
         return _err(str(e), 401)
 
-    # Verify caller is staff (not a student)
     db = _get_db()
     caller_doc = db.collection('users').document(caller_email).get()
     if not caller_doc.exists:
         return _err('Account not found', 403)
-    caller_data = caller_doc.to_dict()
-    if caller_data.get('role') not in ('super_admin', 'school_admin', 'sub_admin', 'teacher'):
+    if caller_doc.to_dict().get('role') not in ('super_admin', 'school_admin', 'sub_admin', 'teacher'):
         return _err('Not authorised', 403)
 
     body             = request.get_json(force=True, silent=True) or {}
@@ -786,8 +761,7 @@ def generate_audit_xlsx():
     filename = f"{safe}.xlsx"
 
     resp = make_response(data)
-    resp.headers['Content-Type']        = (
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    resp.headers['Content-Type']        = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     resp.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
     for k, v in CORS.items():
         resp.headers[k] = v
@@ -796,7 +770,6 @@ def generate_audit_xlsx():
 
 def _build_audit_xlsx(title, school, academic_session, term, exam_type,
                        requested_by, scope, rows):
-    # Colour scheme — amber to distinguish from normal results
     AMBER        = 'B45309'
     AMBER_LIGHT  = 'D97706'
     AMBER_PALE   = 'FEF3C7'
@@ -804,7 +777,7 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
     GREEN_OK     = '059669'
     RED_NO       = 'DC2626'
     GREY_NA      = '9CA3AF'
-    STUDENT_BG   = '166534'   # dark green for student banner
+    STUDENT_BG   = '166534'
 
     FILL_AMBER       = PatternFill('solid', fgColor=AMBER)
     FILL_AMBER_LIGHT = PatternFill('solid', fgColor=AMBER_LIGHT)
@@ -829,58 +802,49 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
         cel.fill = fill; cel.font = fnt; cel.alignment = aln or _CENTER
         return cel
 
-    # ── Global header ─────────────────────────────────────────────────────────
     cell_m(row, 1, NC, school.upper() if school else 'ANSWER AUDIT',
            FILL_AMBER, _font(13, True, _WHITE))
-    ws.row_dimensions[row].height = 30;  row += 1
+    ws.row_dimensions[row].height = 30; row += 1
 
-    # Session | Term | Type
     cell_m(row, 1, 2,
            f'Session: {academic_session}' if academic_session else 'Session: —',
            FILL_AMBER_LIGHT, _font(9, True, _WHITE))
-    ws.cell(row=row, column=3, value=f'Term: {term}' if term else 'Term: —'
-            ).fill = FILL_AMBER_LIGHT
-    ws.cell(row=row, column=3).font = _font(9, True, _WHITE)
+    ws.cell(row=row, column=3, value=f'Term: {term}' if term else 'Term: —').fill = FILL_AMBER_LIGHT
+    ws.cell(row=row, column=3).font      = _font(9, True, _WHITE)
     ws.cell(row=row, column=3).alignment = _CENTER
     cell_m(row, 4, NC, f'Type: {exam_type}' if exam_type else 'Type: —',
            FILL_AMBER_LIGHT, _font(9, True, _WHITE))
-    ws.row_dimensions[row].height = 18;  row += 1
+    ws.row_dimensions[row].height = 18; row += 1
 
-    # Report title
     cell_m(row, 1, NC, title, FILL_AMBER_PALE, _font(11, True, AMBER))
-    ws.row_dimensions[row].height = 22;  row += 1
+    ws.row_dimensions[row].height = 22; row += 1
 
-    # Confidential warning
     cell_m(row, 1, NC,
            '⚠  CONFIDENTIAL — Authorised Investigation Use Only',
            FILL_WARN, _font(9, True, RED_NO))
-    ws.row_dimensions[row].height = 16;  row += 1
+    ws.row_dimensions[row].height = 16; row += 1
 
-    # Scope / requested by
     cell_m(row, 1, 2, f'Scope: {scope}' if scope else '',
            FILL_AMBER_PALE, _font(9, False, AMBER))
     cell_m(row, 3, NC, f'Requested by: {requested_by}',
            FILL_AMBER_PALE, _font(9, False, AMBER))
-    ws.row_dimensions[row].height = 14;  row += 1
+    ws.row_dimensions[row].height = 14; row += 1
 
     row += 1  # spacer
 
-    # ── Per-student sections ──────────────────────────────────────────────────
     for stu in rows:
-        q_rows    = stu.get('q_rows', [])
-        pct       = int(stu.get('percentage', 0))
-        score     = stu.get('score', 0)
-        total_qs  = stu.get('total_qs', 0)
-        answered  = stu.get('answered', 0)
-        unanswered= stu.get('unanswered', 0)
+        q_rows     = stu.get('q_rows', [])
+        pct        = int(stu.get('percentage', 0))
+        score      = stu.get('score', 0)
+        total_qs   = stu.get('total_qs', 0)
+        answered   = stu.get('answered', 0)
+        unanswered = stu.get('unanswered', 0)
 
-        # Student banner
         cell_m(row, 1, NC,
                f'{stu.get("name","—")}   ·   {stu.get("email","")}',
                FILL_STUDENT, _font(10, True, _WHITE))
-        ws.row_dimensions[row].height = 20;  row += 1
+        ws.row_dimensions[row].height = 20; row += 1
 
-        # Student meta
         meta = [
             f'Class: {stu.get("class","—")}',
             f'Exam: {stu.get("exam","—")}',
@@ -891,24 +855,22 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
         for col, val in enumerate(meta, 1):
             cel = ws.cell(row=row, column=col, value=val)
             cel.fill = FILL_META; cel.font = _font(9, False, _DARK); cel.alignment = _LEFT
-        ws.row_dimensions[row].height = 16;  row += 1
+        ws.row_dimensions[row].height = 16; row += 1
 
-        # Column headers
         for col, hdr in enumerate(['Q#', 'Question Text', 'Option Picked', 'Correct Answer', 'Correct?'], 1):
             cel = ws.cell(row=row, column=col, value=hdr)
             cel.fill = FILL_COL_HDR; cel.font = _font(9, True, _WHITE); cel.alignment = _CENTER
-        ws.row_dimensions[row].height = 18;  row += 1
+        ws.row_dimensions[row].height = 18; row += 1
 
-        # Question rows
         if not q_rows:
             cell_m(row, 1, NC, '(no answer data recorded)', PatternFill(), _font(9, False, GREY_NA))
-            ws.row_dimensions[row].height = 16;  row += 1
+            ws.row_dimensions[row].height = 16; row += 1
         else:
             for qi, qr in enumerate(q_rows):
-                status   = qr.get('is_correct', 'NO')
-                is_yes   = status == 'YES'
-                is_na    = status == 'NOT ANSWERED'
-                alt_fill = FILL_AMBER_BG if qi % 2 == 0 else PatternFill()
+                status        = qr.get('is_correct', 'NO')
+                is_yes        = status == 'YES'
+                is_na         = status == 'NOT ANSWERED'
+                alt_fill      = FILL_AMBER_BG if qi % 2 == 0 else PatternFill()
                 picked_color  = GREEN_OK if is_yes else (GREY_NA if is_na else RED_NO)
                 status_color  = GREEN_OK if is_yes else (GREY_NA if is_na else RED_NO)
 
@@ -923,22 +885,18 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
                     cel.border = _BORDER; cel.font = _font(9, bld, clr); cel.alignment = aln
                     if qi % 2 == 0: cel.fill = alt_fill
 
-                # Wrap text on Question, Picked, Correct columns
                 for col in [2, 3, 4]:
                     ws.cell(row=row, column=col).alignment = Alignment(
                         horizontal='left', vertical='top', wrap_text=True)
-                ws.row_dimensions[row].height = 32;  row += 1
+                ws.row_dimensions[row].height = 32; row += 1
 
-        # Spacer between students
-        ws.row_dimensions[row].height = 6;  row += 1
+        ws.row_dimensions[row].height = 6; row += 1
 
-    # ── Column widths ─────────────────────────────────────────────────────────
     for col, width in enumerate([4, 52, 32, 32, 12], 1):
         ws.column_dimensions[get_column_letter(col)].width = width
 
     _lock_all(ws)
 
-    # ── Audit Trail sheet ─────────────────────────────────────────────────────
     ws2 = wb.create_sheet('Audit Trail')
     now = datetime.now(timezone.utc).strftime('%d %b %Y  %H:%M UTC')
     trail = [
@@ -954,10 +912,8 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
         ('Generated On',     now),
         ('Total Students',   len(rows)),
         ('', ''),
-        ('Contents',
-         'Question text · Option the student selected · Correct answer · Whether correct.'),
-        ('Does NOT contain',
-         'All answer options are NOT listed — only what was picked and what was correct.'),
+        ('Contents',         'Question text · Option the student selected · Correct answer · Whether correct.'),
+        ('Does NOT contain', 'All answer options are NOT listed — only what was picked and what was correct.'),
         ('Intended use',     'Authorised investigation only. Protected by EduTest Pro.'),
     ]
     for r, (k, v) in enumerate(trail, 1):
@@ -974,15 +930,12 @@ def _build_audit_xlsx(title, school, academic_session, term, exam_type,
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
-# ── Paystack payment verification ────────────────────────────────────────────
+# =============================================================================
+# PAYSTACK PAYMENT ENDPOINTS
+# =============================================================================
 
-@app.route('/init-payment', methods=['POST','OPTIONS'])
+@app.route('/init-payment', methods=['POST', 'OPTIONS'])
 def init_payment():
-    """
-    Initialize a Paystack transaction and return the authorization_url.
-    Called by the client (school_admin) to start a redirect payment flow.
-    The secret key stays on the server — never exposed to the browser.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _cors_headers(request))
@@ -992,7 +945,6 @@ def init_payment():
         _secret_ok(request)
         caller_email, _ = _verify_token(request)
 
-        # Verify caller is school_admin
         db = _get_db()
         caller_doc = db.collection('users').document(caller_email).get()
         if not caller_doc.exists:
@@ -1002,16 +954,15 @@ def init_payment():
             return _err('Not authorised', 403, request)
 
         body      = request.get_json(force=True, silent=True) or {}
-        school_id = (body.get('schoolId') or '').strip()
-        amount    = int(body.get('amount', 0))        # in NGN (not kobo)
-        email     = (body.get('email')    or '').strip()
-        reference = (body.get('reference') or '').strip()
-        callback  = (body.get('callbackUrl') or 'https://edutest-pro-cbt.web.app/app.html').strip()
+        school_id = (body.get('schoolId')    or '').strip()
+        amount    = int(body.get('amount', 0))
+        email     = (body.get('email')       or '').strip()
+        reference = (body.get('reference')   or '').strip()
+        callback  = (body.get('callbackUrl') or 'https://edutest-pro.online/app.html').strip()
 
         if not school_id or not amount or not email:
             return _err('schoolId, amount, and email are required', 400, request)
 
-        # Verify caller belongs to this school (unless super_admin)
         if caller_data.get('role') == 'school_admin':
             if caller_data.get('schoolId') != school_id:
                 return _err('Not authorised for this school', 403, request)
@@ -1020,7 +971,6 @@ def init_payment():
         if not paystack_secret:
             return _err('Payment gateway not configured on server', 500, request)
 
-        # Call Paystack Initialize API with the secret key (server-side only)
         resp = requests.post(
             'https://api.paystack.co/transaction/initialize',
             headers={
@@ -1029,7 +979,7 @@ def init_payment():
             },
             json={
                 'email':        email,
-                'amount':       amount * 100,   # convert NGN to kobo
+                'amount':       amount * 100,
                 'currency':     'NGN',
                 'reference':    reference,
                 'callback_url': callback,
@@ -1049,7 +999,7 @@ def init_payment():
             return _err(msg, 400, request)
 
         return _json_resp({
-            'ok':              True,
+            'ok':                True,
             'authorization_url': data['data']['authorization_url'],
             'reference':         data['data']['reference'],
             'access_code':       data['data'].get('access_code', ''),
@@ -1062,7 +1012,7 @@ def init_payment():
         return _err(str(e), 500, request)
 
 
-@app.route('/verify-payment', methods=['POST','OPTIONS'])
+@app.route('/verify-payment', methods=['POST', 'OPTIONS'])
 def verify_payment():
     request = flask_request
     if request.method == 'OPTIONS':
@@ -1073,7 +1023,6 @@ def verify_payment():
         _secret_ok(request)
         caller_email, _ = _verify_token(request)
 
-        # Verify caller is school_admin
         db = _get_db()
         caller_doc = db.collection('users').document(caller_email).get()
         if not caller_doc.exists:
@@ -1084,13 +1033,12 @@ def verify_payment():
 
         body      = request.get_json(force=True, silent=True) or {}
         reference = (body.get('reference') or '').strip()
-        school_id = (body.get('schoolId')   or '').strip()
+        school_id = (body.get('schoolId')  or '').strip()
         amount    = int(body.get('amount', 0))
 
         if not reference or not school_id:
             return _err('reference and schoolId required', 400, request)
 
-        # Verify with Paystack API
         paystack_secret = os.environ.get('PAYSTACK_SECRET_KEY', '')
         if not paystack_secret:
             return _err('Payment gateway not configured', 500, request)
@@ -1109,24 +1057,22 @@ def verify_payment():
         if paid_amount_kobo < amount * 100:
             return _err('Payment amount insufficient', 402, request)
 
-        # Activate subscription — set start to today, duration from school doc
         school_snap = db.collection('schools').document(school_id).get()
         if not school_snap.exists:
             return _err('School not found', 404, request)
         school_data = school_snap.to_dict()
 
-        # Verify caller belongs to this school (unless super_admin)
         if caller_data.get('role') == 'school_admin':
             if caller_data.get('schoolId') != school_id:
                 return _err('Not authorised for this school', 403, request)
 
         sub_days = school_data.get('subscriptionDays', 270)
         db.collection('schools').document(school_id).update({
-            'subscriptionStart': datetime.now(timezone.utc).isoformat(),
-            'subscriptionDays':  sub_days,
-            'lastPaymentRef':    reference,
-            'lastPaymentAmount': paid_amount_kobo // 100,
-            'lastPaymentDate':   datetime.now(timezone.utc).isoformat(),
+            'subscriptionStart':  datetime.now(timezone.utc).isoformat(),
+            'subscriptionDays':   sub_days,
+            'lastPaymentRef':     reference,
+            'lastPaymentAmount':  paid_amount_kobo // 100,
+            'lastPaymentDate':    datetime.now(timezone.utc).isoformat(),
         })
 
         return _json_resp({'ok': True, 'message': 'Subscription activated'}, req=request)
@@ -1138,41 +1084,9 @@ def verify_payment():
         return _err(str(e), 500, request)
 
 
-# ── Eager Firebase init at startup ────────────────────────────────────────────
-# Initialize Firebase Admin when gunicorn loads the module, not lazily per-request.
-# This catches missing SERVICE_ACCOUNT_JSON immediately on startup.
-try:
-    _get_db()
-    print('[STARTUP] Firebase Admin initialized successfully')
-except Exception as _e:
-    print('[STARTUP] WARNING: Firebase Admin init failed:', _e)
-
-
-
-
-# ── Eager Firebase init at startup ────────────────────────────────────────────
-# Initialize Firebase Admin when gunicorn loads the module, not lazily per-request.
-# This catches missing SERVICE_ACCOUNT_JSON immediately on startup.
-try:
-    _get_db()
-    print('[STARTUP] Firebase Admin initialized successfully')
-except Exception as _e:
-    print('[STARTUP] WARNING: Firebase Admin init failed:', _e)
-
-
-
 # =============================================================================
-# RDS — Result Distribution System Integration
-# Token bridge: CBT generates signed HMAC-SHA256 token → RDS validates it
+# RDS — Token Bridge
 # =============================================================================
-
-import hmac
-import hashlib
-import base64
-import uuid
-
-RDS_URL = os.environ.get('RDS_URL', 'https://edutest-rds.web.app')
-
 
 def _rds_secret():
     secret = os.environ.get('RDS_BRIDGE_SECRET', '')
@@ -1181,53 +1095,11 @@ def _rds_secret():
     return secret
 
 
-def _make_rds_cors(req=None):
-    """CORS headers that allow both CBT and RDS frontend origins."""
-    origin = (req.headers.get('Origin', '') if req else '') or ''
-
-    # Build set of allowed origins — includes all known Firebase Hosting domains
-    rds_base = RDS_URL.rstrip('/')
-    allowed_origins = {
-        # CBT origins
-        'https://edutest-pro-cbt.web.app',
-        'https://edutest-pro-cbt.firebaseapp.com',
-        # RDS origins (web.app and firebaseapp.com variants)
-        rds_base,
-        rds_base.replace('.web.app', '.firebaseapp.com'),
-        rds_base + ':443',
-    }
-
-    # Allow any *.web.app or *.firebaseapp.com origin (all Firebase Hosting)
-    is_firebase = (
-        origin.endswith('.web.app') or
-        origin.endswith('.firebaseapp.com')
-    )
-
-    if origin in allowed_origins or is_firebase:
-        allowed = origin
-    else:
-        allowed = rds_base
-
-    return {
-        'Access-Control-Allow-Origin':  allowed,
-        'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-EduTest-Key',
-        'Access-Control-Allow-Credentials': 'false',
-        'Vary': 'Origin',
-    }
-
-
 @app.route('/launch-rds', methods=['POST', 'OPTIONS'])
 def launch_rds():
-    """
-    Called by CBT app.js when a user clicks "Result Distribution".
-    Generates a signed one-time token and returns the RDS redirect URL.
-    Only school_admin, sub_admin, teacher, and super_admin can access RDS.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
-
     try:
         _secret_ok(request)
         caller_email, _ = _verify_token(request)
@@ -1238,12 +1110,11 @@ def launch_rds():
             return _rds_json_resp({'ok': False, 'error': 'Account not found'}, 403, request)
 
         caller = caller_doc.to_dict()
-        allowed_roles = ('super_admin', 'school_admin', 'sub_admin', 'teacher')
-        if caller.get('role') not in allowed_roles:
-            return _rds_json_resp({'ok': False, 'error': 'Your role does not have access to Result Distribution System.'}, 403, request)
+        if caller.get('role') not in ('super_admin', 'school_admin', 'sub_admin', 'teacher'):
+            return _rds_json_resp({'ok': False,
+                'error': 'Your role does not have access to Result Distribution System.'}, 403, request)
 
-        # Build token payload
-        nonce = uuid.uuid4().hex
+        nonce  = uuid.uuid4().hex
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         payload = {
             'uid':      caller_email,
@@ -1252,11 +1123,10 @@ def launch_rds():
             'email':    caller_email,
             'name':     caller.get('name', caller_email),
             'iat':      now_ms,
-            'exp':      now_ms + 60000,   # 60-second window
+            'exp':      now_ms + 60000,
             'nonce':    nonce,
         }
 
-        # Encode and sign
         encoded = base64.urlsafe_b64encode(
             json.dumps(payload, separators=(',', ':')).encode()
         ).rstrip(b'=').decode()
@@ -1269,16 +1139,15 @@ def launch_rds():
 
         token = f'{encoded}.{sig}'
 
-        # Store nonce in Firestore (one-time use enforcement)
         db.collection('rds_nonces').document(nonce).set({
-            'uid':      caller_email,
-            'schoolId': caller.get('schoolId', ''),
-            'usedAt':   None,
+            'uid':       caller_email,
+            'schoolId':  caller.get('schoolId', ''),
+            'usedAt':    None,
             'expiresAt': datetime.fromtimestamp((now_ms + 60000) / 1000, tz=timezone.utc),
             'createdAt': datetime.now(timezone.utc),
         })
 
-        redirect_url = f'{RDS_URL}/access?token={requests.utils.quote(token)}'
+        redirect_url = f'{RDS_URL.rstrip("/")}/access?token={requests.utils.quote(token)}'
         return _rds_json_resp({'ok': True, 'redirectUrl': redirect_url}, req=request)
 
     except PermissionError as e:
@@ -1290,24 +1159,17 @@ def launch_rds():
 
 @app.route('/rds-verify', methods=['POST', 'OPTIONS'])
 def rds_verify():
-    """
-    Called by rds.html AccessGate on first load.
-    Verifies the token, consumes the nonce, creates an 8-hour session.
-    No auth header needed here — the token IS the credential.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
-
     try:
-        body = request.get_json(force=True, silent=True) or {}
+        body  = request.get_json(force=True, silent=True) or {}
         token = (body.get('token') or '').strip()
 
         if not token or '.' not in token:
             return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_TOKEN_FORMAT',
                 'message': 'Malformed access token. Please try again from CBT.'}, 400, request)
 
-        # Split token
         parts = token.rsplit('.', 1)
         if len(parts) != 2:
             return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_TOKEN_FORMAT',
@@ -1315,7 +1177,6 @@ def rds_verify():
 
         encoded, received_sig = parts
 
-        # Verify signature
         expected_sig = hmac.new(
             _rds_secret().encode(),
             encoded.encode(),
@@ -1326,29 +1187,25 @@ def rds_verify():
             return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_SIGNATURE',
                 'message': 'Access token signature is invalid. Please try again from CBT.'}, 401, request)
 
-        # Decode payload
         try:
             padding = 4 - len(encoded) % 4
-            padded = encoded + '=' * (padding % 4)
+            padded  = encoded + '=' * (padding % 4)
             payload = json.loads(base64.urlsafe_b64decode(padded).decode())
         except Exception:
             return _rds_json_resp({'ok': False, 'errorCode': 'INVALID_PAYLOAD',
                 'message': 'Access token data is corrupted. Please try again from CBT.'}, 400, request)
 
-        # Check required fields
         required = ('uid', 'role', 'email', 'name', 'iat', 'exp', 'nonce')
         if not all(k in payload for k in required):
             return _rds_json_resp({'ok': False, 'errorCode': 'INCOMPLETE_PAYLOAD',
                 'message': 'Access token is missing required data. Please try again from CBT.'}, 400, request)
 
-        # Check expiry
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         if now_ms > payload['exp']:
             return _rds_json_resp({'ok': False, 'errorCode': 'TOKEN_EXPIRED',
                 'message': 'Access token has expired. Please click Result Distribution again in CBT.'}, 401, request)
 
-        # Check nonce (one-time use)
-        db = _get_db()
+        db    = _get_db()
         nonce = payload['nonce']
         nonce_doc = db.collection('rds_nonces').document(nonce).get()
 
@@ -1361,55 +1218,44 @@ def rds_verify():
             return _rds_json_resp({'ok': False, 'errorCode': 'TOKEN_ALREADY_USED',
                 'message': 'This access token has already been used. Please click Result Distribution again in CBT.'}, 401, request)
 
-        # Mark nonce as used
         db.collection('rds_nonces').document(nonce).update({
             'usedAt': datetime.now(timezone.utc)
         })
 
-        # Check school subscription (skip for super_admin)
-        role = payload['role']
+        role      = payload['role']
         school_id = payload.get('schoolId', '')
         if role != 'super_admin' and school_id:
             school_snap = db.collection('schools').document(school_id).get()
             if school_snap.exists:
                 school_data = school_snap.to_dict()
-                # Use the same calcSubStatus logic as the frontend
-                sub_start = school_data.get('subscriptionStart')
-                sub_days  = school_data.get('subscriptionDays', 0)
-                grace     = school_data.get('gracePeriodDays', 7)
-                paused    = school_data.get('subscriptionPaused', False)
+                sub_start   = school_data.get('subscriptionStart')
+                sub_days    = school_data.get('subscriptionDays', 0)
+                grace       = school_data.get('gracePeriodDays', 7)
+                paused      = school_data.get('subscriptionPaused', False)
 
                 if paused:
                     return _rds_json_resp({'ok': False, 'errorCode': 'SUBSCRIPTION_PAUSED',
                         'message': 'Result Distribution is not available — subscription is paused. Contact support.'}, 403, request)
 
                 if sub_start and sub_days:
-                    from datetime import timedelta
-                    start_dt = datetime.fromisoformat(sub_start.replace('Z', '+00:00')) if isinstance(sub_start, str) else sub_start
-                    expiry   = start_dt + timedelta(days=sub_days)
+                    start_dt  = datetime.fromisoformat(sub_start.replace('Z', '+00:00')) if isinstance(sub_start, str) else sub_start
+                    expiry    = start_dt + timedelta(days=sub_days)
                     grace_end = expiry + timedelta(days=grace)
-                    now_dt    = datetime.now(timezone.utc)
-                    if now_dt > grace_end:
+                    if datetime.now(timezone.utc) > grace_end:
                         return _rds_json_resp({'ok': False, 'errorCode': 'SUBSCRIPTION_EXPIRED',
                             'message': 'RDS subscription has expired. Please renew in EduTest Pro CBT.'}, 403, request)
 
-        # Create 8-hour session
-        session_id = str(uuid.uuid4())
-        expires_at = datetime.now(timezone.utc).replace(
-            second=0, microsecond=0
-        )
-        from datetime import timedelta
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=8)
-
+        session_id   = str(uuid.uuid4())
+        expires_at   = datetime.now(timezone.utc) + timedelta(hours=8)
         session_data = {
-            'sessionId': session_id,
-            'uid':       payload['uid'],
-            'role':      role,
-            'schoolId':  school_id,
-            'email':     payload['email'],
-            'name':      payload['name'],
-            'createdAt': datetime.now(timezone.utc),
-            'expiresAt': expires_at,
+            'sessionId':  session_id,
+            'uid':        payload['uid'],
+            'role':       role,
+            'schoolId':   school_id,
+            'email':      payload['email'],
+            'name':       payload['name'],
+            'createdAt':  datetime.now(timezone.utc),
+            'expiresAt':  expires_at,
             'lastActive': datetime.now(timezone.utc),
         }
         db.collection('rds_sessions').document(session_id).set(session_data)
@@ -1436,37 +1282,31 @@ def rds_verify():
 
 @app.route('/rds-validate-session', methods=['POST', 'OPTIONS'])
 def rds_validate_session():
-    """Validate an existing RDS session. Called on every RDS page load."""
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
-
     try:
-        body = request.get_json(force=True, silent=True) or {}
+        body       = request.get_json(force=True, silent=True) or {}
         session_id = (body.get('sessionId') or '').strip()
 
         if not session_id:
             return _rds_json_resp({'valid': False, 'reason': 'NO_SESSION'}, 401, request)
 
-        db = _get_db()
+        db   = _get_db()
         snap = db.collection('rds_sessions').document(session_id).get()
 
         if not snap.exists:
             return _rds_json_resp({'valid': False, 'reason': 'SESSION_NOT_FOUND'}, 401, request)
 
-        sess = snap.to_dict()
+        sess       = snap.to_dict()
         expires_at = sess.get('expiresAt')
-
-        # Handle both datetime objects and strings
         if isinstance(expires_at, str):
-            from datetime import timedelta
             expires_at = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
 
         if expires_at and datetime.now(timezone.utc) > expires_at:
             db.collection('rds_sessions').document(session_id).delete()
             return _rds_json_resp({'valid': False, 'reason': 'SESSION_EXPIRED'}, 401, request)
 
-        # Update lastActive
         db.collection('rds_sessions').document(session_id).update({
             'lastActive': datetime.now(timezone.utc)
         })
@@ -1489,96 +1329,56 @@ def rds_validate_session():
 
 @app.route('/rds-logout', methods=['POST', 'OPTIONS'])
 def rds_logout():
-    """Destroy an RDS session."""
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
-
     try:
-        body = request.get_json(force=True, silent=True) or {}
+        body       = request.get_json(force=True, silent=True) or {}
         session_id = (body.get('sessionId') or '').strip()
-
         if session_id:
-            db = _get_db()
-            db.collection('rds_sessions').document(session_id).delete()
-
+            _get_db().collection('rds_sessions').document(session_id).delete()
         return _rds_json_resp({'ok': True}, req=request)
-
     except Exception as e:
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
 
 
-
 # =============================================================================
 # RDS — Phase 1: Student Registration
-# Collection: rds_students (in CBT Firestore, edutest-pro-6dd48)
-# 
-# Document schema:
-#   id            : auto-generated
-#   schoolId      : from session
-#   teacherId     : uid of teacher who added/manages this student
-#   name          : student full name
-#   email         : student Gmail (nullable for non-CBT students)
-#   classGrade    : e.g. "SS2A", "JSS1B"
-#   admissionNumber: school admission number (optional)
-#   parentEmail   : parent/guardian email for result delivery
-#   parentWhatsapp: parent WhatsApp number (with country code)
-#   source        : "cbt" | "manual"
-#   cbtSynced     : true if pulled from CBT users collection
-#   createdAt     : timestamp
-#   updatedAt     : timestamp
-#   createdBy     : teacher uid
 # =============================================================================
-
 
 @app.route('/rds-students/list', methods=['POST', 'OPTIONS'])
 def rds_students_list():
-    """
-    List all RDS students for a school.
-    Teacher sees own students; school_admin and sub_admin see all.
-    Accepts optional filters: classGrade, source.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        body      = request.get_json(force=True, silent=True) or {}
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
-
         db = _get_db()
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s = sess.to_dict()
+        s  = _rds_session(request, db)
         role       = s.get('role')
         school_id  = s.get('schoolId')
         teacher_id = s.get('uid')
 
-        q = db.collection('rds_students').where('schoolId', '==', school_id)
-
-        # Teachers only see students they registered
+        body = request.get_json(force=True, silent=True) or {}
+        q    = db.collection('rds_students').where('schoolId', '==', school_id)
         if role == 'teacher':
             q = q.where('teacherId', '==', teacher_id)
-
-        # Optional filters
         if body.get('classGrade'):
             q = q.where('classGrade', '==', body['classGrade'])
         if body.get('source'):
             q = q.where('source', '==', body['source'])
 
-        docs = q.order_by('name').get()
+        docs     = q.order_by('name').get()
         students = []
         for d in docs:
-            row = d.to_dict()
-            row['id'] = d.id
-            # Convert timestamps to ISO strings
+            row = d.to_dict(); row['id'] = d.id
             for f in ('createdAt', 'updatedAt'):
-                if row.get(f) and hasattr(row[f], 'isoformat'):
-                    row[f] = row[f].isoformat()
+                row[f] = _ts(row.get(f))
             students.append(row)
 
         return _rds_json_resp({'ok': True, 'students': students, 'count': len(students)}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -1586,23 +1386,12 @@ def rds_students_list():
 
 @app.route('/rds-students/sync-cbt', methods=['POST', 'OPTIONS'])
 def rds_students_sync_cbt():
-    """
-    Pull CBT students for this school into rds_students.
-    Only creates records that do not already exist (matched by email).
-    Returns counts: { created, skipped, total }.
-    Called by teacher — imports their school's CBT students into RDS.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s = sess.to_dict()
+        s  = _rds_session(request, db)
         role       = s.get('role')
         school_id  = s.get('schoolId')
         teacher_id = s.get('uid')
@@ -1610,24 +1399,26 @@ def rds_students_sync_cbt():
         if role not in ('teacher', 'school_admin', 'sub_admin', 'super_admin'):
             return _rds_json_resp({'ok': False, 'error': 'Not authorised'}, 403, request)
 
-        # Fetch all CBT students for this school
-        cbt_snap = db.collection('users')             .where('schoolId', '==', school_id)             .where('role', '==', 'student')             .get()
+        cbt_snap = (db.collection('users')
+                      .where('schoolId', '==', school_id)
+                      .where('role', '==', 'student')
+                      .get())
 
         created = 0
         skipped = 0
 
         for doc in cbt_snap:
-            cbt = doc.to_dict()
-            email = doc.id  # CBT uses email as doc ID
+            cbt   = doc.to_dict()
+            email = doc.id
 
-            # Check if already in rds_students
-            existing = db.collection('rds_students')                 .where('schoolId', '==', school_id)                 .where('email', '==', email)                 .limit(1).get()
-
+            existing = (db.collection('rds_students')
+                          .where('schoolId', '==', school_id)
+                          .where('email', '==', email)
+                          .limit(1).get())
             if existing:
                 skipped += 1
                 continue
 
-            # Create rds_students record
             db.collection('rds_students').add({
                 'schoolId':        school_id,
                 'teacherId':       teacher_id,
@@ -1653,6 +1444,8 @@ def rds_students_sync_cbt():
             'message': f'{created} student(s) imported, {skipped} already existed.',
         }, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -1660,41 +1453,31 @@ def rds_students_sync_cbt():
 
 @app.route('/rds-students/add', methods=['POST', 'OPTIONS'])
 def rds_students_add():
-    """
-    Manually add a single student (non-CBT or additional details).
-    Required: name, classGrade
-    Optional: email, admissionNumber, parentEmail, parentWhatsapp
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s = sess.to_dict()
+        s  = _rds_session(request, db)
         school_id  = s.get('schoolId')
         teacher_id = s.get('uid')
 
-        body = request.get_json(force=True, silent=True) or {}
-        name       = (body.get('name') or '').strip()
+        body        = request.get_json(force=True, silent=True) or {}
+        name        = (body.get('name') or '').strip()
         class_grade = (body.get('classGrade') or '').strip()
 
-        if not name:
-            return _rds_json_resp({'ok': False, 'error': 'Student name is required.'}, 400, request)
-        if not class_grade:
-            return _rds_json_resp({'ok': False, 'error': 'Class/Grade is required.'}, 400, request)
+        if not name:        return _rds_json_resp({'ok': False, 'error': 'Student name is required.'}, 400, request)
+        if not class_grade: return _rds_json_resp({'ok': False, 'error': 'Class/Grade is required.'}, 400, request)
 
         email = (body.get('email') or '').strip().lower()
-
-        # Check for duplicate email within school
         if email:
-            dup = db.collection('rds_students')                 .where('schoolId', '==', school_id)                 .where('email', '==', email)                 .limit(1).get()
+            dup = (db.collection('rds_students')
+                     .where('schoolId', '==', school_id)
+                     .where('email', '==', email)
+                     .limit(1).get())
             if dup:
-                return _rds_json_resp({'ok': False, 'error': f'A student with email {email} already exists in this school.'}, 409, request)
+                return _rds_json_resp({'ok': False,
+                    'error': f'A student with email {email} already exists in this school.'}, 409, request)
 
         ref, _ = db.collection('rds_students').add({
             'schoolId':        school_id,
@@ -1712,8 +1495,11 @@ def rds_students_add():
             'createdBy':       teacher_id,
         })
 
-        return _rds_json_resp({'ok': True, 'id': ref.id, 'message': f'Student "{name}" added successfully.'}, req=request)
+        return _rds_json_resp({'ok': True, 'id': ref.id,
+            'message': f'Student "{name}" added successfully.'}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -1721,49 +1507,37 @@ def rds_students_add():
 
 @app.route('/rds-students/update/<student_id>', methods=['POST', 'OPTIONS'])
 def rds_students_update(student_id):
-    """
-    Update parent contact details and other fields on an rds_student.
-    Teacher can update their own students.
-    school_admin / sub_admin can update any student in their school.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s = sess.to_dict()
+        s  = _rds_session(request, db)
         role       = s.get('role')
         school_id  = s.get('schoolId')
         teacher_id = s.get('uid')
 
-        doc_ref = db.collection('rds_students').document(student_id)
-        doc     = doc_ref.get()
+        doc_ref  = db.collection('rds_students').document(student_id)
+        doc      = doc_ref.get()
         if not doc.exists:
             return _rds_json_resp({'ok': False, 'error': 'Student not found.'}, 404, request)
 
         existing = doc.to_dict()
         if existing.get('schoolId') != school_id:
             return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
-
-        # Teachers can only update their own students
         if role == 'teacher' and existing.get('teacherId') != teacher_id:
             return _rds_json_resp({'ok': False, 'error': 'You can only update students you registered.'}, 403, request)
 
-        body = request.get_json(force=True, silent=True) or {}
-
-        # Only allow updating safe fields
+        body    = request.get_json(force=True, silent=True) or {}
         allowed = ('parentEmail', 'parentWhatsapp', 'admissionNumber', 'classGrade', 'name')
         updates = {k: (body[k] or '').strip() for k in allowed if k in body}
         updates['updatedAt'] = datetime.now(timezone.utc)
-
         doc_ref.update(updates)
+
         return _rds_json_resp({'ok': True, 'message': 'Student updated successfully.'}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -1771,37 +1545,32 @@ def rds_students_update(student_id):
 
 @app.route('/rds-students/delete/<student_id>', methods=['POST', 'OPTIONS'])
 def rds_students_delete(student_id):
-    """Delete a manually-added student (cannot delete CBT-synced students)."""
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s = sess.to_dict()
+        s  = _rds_session(request, db)
         role       = s.get('role')
         school_id  = s.get('schoolId')
         teacher_id = s.get('uid')
 
-        doc_ref = db.collection('rds_students').document(student_id)
-        doc     = doc_ref.get()
+        doc_ref  = db.collection('rds_students').document(student_id)
+        doc      = doc_ref.get()
         if not doc.exists:
             return _rds_json_resp({'ok': False, 'error': 'Student not found.'}, 404, request)
 
         existing = doc.to_dict()
         if existing.get('schoolId') != school_id:
             return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
-
         if role == 'teacher' and existing.get('teacherId') != teacher_id:
             return _rds_json_resp({'ok': False, 'error': 'You can only delete students you registered.'}, 403, request)
 
         doc_ref.delete()
         return _rds_json_resp({'ok': True, 'message': 'Student deleted.'}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -1809,28 +1578,17 @@ def rds_students_delete(student_id):
 
 @app.route('/rds-students/bulk-add', methods=['POST', 'OPTIONS'])
 def rds_students_bulk_add():
-    """
-    Bulk add non-CBT students from a JSON array.
-    Each item: { name, classGrade, admissionNumber?, parentEmail?, parentWhatsapp?, email? }
-    Returns { created, failed[] }
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s = sess.to_dict()
+        s  = _rds_session(request, db)
         school_id  = s.get('schoolId')
         teacher_id = s.get('uid')
 
         body = request.get_json(force=True, silent=True) or {}
         rows = body.get('students', [])
-
         if not rows or not isinstance(rows, list):
             return _rds_json_resp({'ok': False, 'error': 'No student data provided.'}, 400, request)
 
@@ -1842,16 +1600,16 @@ def rds_students_bulk_add():
         for row in rows:
             name        = (row.get('name') or '').strip()
             class_grade = (row.get('classGrade') or '').strip()
-
             if not name or not class_grade:
                 failed.append(f'Row skipped — name and classGrade are required: {row}')
                 continue
 
             email = (row.get('email') or '').strip().lower()
-
-            # Duplicate check for email
             if email:
-                dup = db.collection('rds_students')                     .where('schoolId', '==', school_id)                     .where('email', '==', email)                     .limit(1).get()
+                dup = (db.collection('rds_students')
+                         .where('schoolId', '==', school_id)
+                         .where('email', '==', email)
+                         .limit(1).get())
                 if dup:
                     failed.append(f'{name} ({email}) — already exists')
                     continue
@@ -1874,12 +1632,10 @@ def rds_students_bulk_add():
             })
             created += 1
             count   += 1
-
-            # Firestore batch limit is 500
             if count == 499:
                 batch.commit()
-                batch  = db.batch()
-                count  = 0
+                batch = db.batch()
+                count = 0
 
         if count > 0:
             batch.commit()
@@ -1891,6 +1647,8 @@ def rds_students_bulk_add():
             'message': f'{created} student(s) added successfully.',
         }, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -1898,35 +1656,30 @@ def rds_students_bulk_add():
 
 @app.route('/rds-students/classes', methods=['POST', 'OPTIONS'])
 def rds_students_classes():
-    """Return distinct classGrade values for this school's rds_students."""
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
-        db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        school_id = sess.to_dict().get('schoolId')
+        db        = _get_db()
+        s         = _rds_session(request, db)
+        school_id = s.get('schoolId')
 
         docs   = db.collection('rds_students').where('schoolId', '==', school_id).get()
-        grades = sorted(set(d.to_dict().get('classGrade', '') for d in docs if d.to_dict().get('classGrade')))
-
+        grades = sorted(set(
+            d.to_dict().get('classGrade', '')
+            for d in docs if d.to_dict().get('classGrade')
+        ))
         return _rds_json_resp({'ok': True, 'classes': grades}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
 
 
-
 # =============================================================================
 # RDS — Phase 2: Result File Creation & Management
-# Collections: rds_result_files, rds_result_entries
 # =============================================================================
-
-# ── Grading helpers ────────────────────────────────────────────────────────────
 
 def _compute_grade(total, max_score=100):
     """Nigerian WAEC/NECO grading system."""
@@ -1942,20 +1695,16 @@ def _compute_grade(total, max_score=100):
     if pct >= 40: return 'E8'
     return 'F9'
 
+
 def _compute_remark(grade):
-    remarks = {
+    return {
         'A1': 'Excellent', 'B2': 'Very Good', 'B3': 'Good',
-        'C4': 'Credit', 'C5': 'Credit', 'C6': 'Credit',
-        'D7': 'Pass', 'E8': 'Pass', 'F9': 'Fail'
-    }
-    return remarks.get(grade, '—')
+        'C4': 'Credit',    'C5': 'Credit',    'C6': 'Credit',
+        'D7': 'Pass',      'E8': 'Pass',      'F9': 'Fail',
+    }.get(grade, '—')
+
 
 def _compute_positions(entries):
-    """
-    Assign class positions based on totalScore descending.
-    Handles ties — students with equal totalScore share a position.
-    Returns dict: {entryId: position_string}
-    """
     sorted_entries = sorted(entries, key=lambda e: e.get('totalScore', 0), reverse=True)
     positions = {}
     pos = 1
@@ -1965,78 +1714,88 @@ def _compute_positions(entries):
         positions[entry['id']] = pos
     return positions
 
+
 def _ordinal(n):
     if 11 <= n % 100 <= 13:
         return f'{n}th'
     return f'{n}{["th","st","nd","rd","th","th","th","th","th","th"][n % 10]}'
 
 
-# ── Result File CRUD ───────────────────────────────────────────────────────────
+def _serialize_file(doc):
+    row = doc.to_dict()
+    row['id'] = doc.id
+    for f in ('createdAt', 'updatedAt', 'submittedAt', 'approvedAt',
+              'rejectedAt', 'distributedAt'):
+        row[f] = _ts(row.get(f))
+    return row
+
 
 @app.route('/rds-result-files/create', methods=['POST', 'OPTIONS'])
 def rds_result_files_create():
-    """
-    Create a new result file (draft).
-    Required: session, term, classGrade, subject
-    Optional: cbtExamId (link to CBT exam for auto-pulling scores)
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s          = sess.to_dict()
-        school_id  = s.get('schoolId')
-        teacher_id = s.get('uid')
+        s  = _rds_session(request, db)
+        school_id    = s.get('schoolId')
+        teacher_id   = s.get('uid')
         teacher_name = s.get('name', '')
 
-        body       = request.get_json(force=True, silent=True) or {}
-        session_yr = (body.get('session') or '').strip()
-        term       = (body.get('term') or '').strip()
-        class_grade= (body.get('classGrade') or '').strip()
-        subject    = (body.get('subject') or '').strip()
-        cbt_exam_id= (body.get('cbtExamId') or '').strip()
+        body        = request.get_json(force=True, silent=True) or {}
+        session_yr  = (body.get('session')    or '').strip()
+        term        = (body.get('term')        or '').strip()
+        class_grade = (body.get('classGrade') or '').strip()
+        subject     = (body.get('subject')    or '').strip()
+        cbt_exam_id = (body.get('cbtExamId')  or '').strip()
 
-        if not session_yr: return _rds_json_resp({'ok': False, 'error': 'Academic session is required.'}, 400, request)
-        if not term:       return _rds_json_resp({'ok': False, 'error': 'Term is required.'}, 400, request)
-        if not class_grade:return _rds_json_resp({'ok': False, 'error': 'Class/Grade is required.'}, 400, request)
-        if not subject:    return _rds_json_resp({'ok': False, 'error': 'Subject is required.'}, 400, request)
+        if not session_yr:  return _rds_json_resp({'ok': False, 'error': 'Academic session is required.'}, 400, request)
+        if not term:        return _rds_json_resp({'ok': False, 'error': 'Term is required.'}, 400, request)
+        if not class_grade: return _rds_json_resp({'ok': False, 'error': 'Class/Grade is required.'}, 400, request)
+        if not subject:     return _rds_json_resp({'ok': False, 'error': 'Subject is required.'}, 400, request)
 
-        # Prevent duplicate — same teacher, school, session, term, class, subject
-        dup = db.collection('rds_result_files')             .where('schoolId',   '==', school_id)             .where('teacherId',  '==', teacher_id)             .where('session',    '==', session_yr)             .where('term',       '==', term)             .where('classGrade', '==', class_grade)             .where('subject',    '==', subject)             .limit(1).get()
+        dup = (db.collection('rds_result_files')
+                 .where('schoolId',   '==', school_id)
+                 .where('teacherId',  '==', teacher_id)
+                 .where('session',    '==', session_yr)
+                 .where('term',       '==', term)
+                 .where('classGrade', '==', class_grade)
+                 .where('subject',    '==', subject)
+                 .limit(1).get())
         if dup:
-            return _rds_json_resp({'ok': False, 'error': f'A result file for {subject} — {class_grade} — {term} {session_yr} already exists.'}, 409, request)
+            return _rds_json_resp({'ok': False,
+                'error': f'A result file for {subject} — {class_grade} — {term} {session_yr} already exists.'}, 409, request)
 
         ref, _ = db.collection('rds_result_files').add({
-            'schoolId':        school_id,
-            'teacherId':       teacher_id,
-            'teacherName':     teacher_name,
-            'session':         session_yr,
-            'term':            term,
-            'classGrade':      class_grade,
-            'subject':         subject,
-            'cbtExamId':       cbt_exam_id,
-            'status':          'draft',
-            'totalStudents':   0,
-            'createdAt':       datetime.now(timezone.utc),
-            'updatedAt':       datetime.now(timezone.utc),
-            'submittedAt':     None,
-            'approvedAt':      None,
-            'approvedBy':      None,
-            'rejectedAt':      None,
-            'rejectedBy':      None,
-            'rejectionComment':None,
-            'distributedAt':   None,
+            'schoolId':         school_id,
+            'teacherId':        teacher_id,
+            'teacherName':      teacher_name,
+            'session':          session_yr,
+            'term':             term,
+            'classGrade':       class_grade,
+            'subject':          subject,
+            'cbtExamId':        cbt_exam_id,
+            # Phase 2 status flow: draft → submitted → approved | rejected → distributed
+            'status':           'draft',
+            'totalStudents':    0,
+            'createdAt':        datetime.now(timezone.utc),
+            'updatedAt':        datetime.now(timezone.utc),
+            'submittedAt':      None,
+            'approvedAt':       None,
+            'approvedBy':       None,
+            'approvedByName':   None,
+            'rejectedAt':       None,
+            'rejectedBy':       None,
+            'rejectedByName':   None,
+            'rejectionComment': None,
+            'distributedAt':    None,
         })
 
         return _rds_json_resp({'ok': True, 'fileId': ref.id,
             'message': f'Result file created for {subject} — {class_grade}.'}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -2044,43 +1803,31 @@ def rds_result_files_create():
 
 @app.route('/rds-result-files/list', methods=['POST', 'OPTIONS'])
 def rds_result_files_list():
-    """List result files — teachers see own, admins/coordinators see all school files."""
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s          = sess.to_dict()
+        s  = _rds_session(request, db)
         role       = s.get('role')
         school_id  = s.get('schoolId')
         teacher_id = s.get('uid')
 
-        q = db.collection('rds_result_files').where('schoolId', '==', school_id)
+        q    = db.collection('rds_result_files').where('schoolId', '==', school_id)
+        body = request.get_json(force=True, silent=True) or {}
+
         if role == 'teacher':
             q = q.where('teacherId', '==', teacher_id)
-
-        body = request.get_json(force=True, silent=True) or {}
         if body.get('status'):
             q = q.where('status', '==', body['status'])
 
         docs  = q.order_by('createdAt', direction='DESCENDING').get()
-        files = []
-        for d in docs:
-            row = d.to_dict()
-            row['id'] = d.id
-            for f in ('createdAt', 'updatedAt', 'submittedAt', 'approvedAt',
-                      'rejectedAt', 'distributedAt'):
-                if row.get(f) and hasattr(row[f], 'isoformat'):
-                    row[f] = row[f].isoformat()
-            files.append(row)
+        files = [_serialize_file(d) for d in docs]
 
         return _rds_json_resp({'ok': True, 'files': files, 'count': len(files)}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -2088,56 +1835,41 @@ def rds_result_files_list():
 
 @app.route('/rds-result-files/get/<file_id>', methods=['POST', 'OPTIONS'])
 def rds_result_files_get(file_id):
-    """Get a single result file with all its entries."""
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s         = sess.to_dict()
+        s  = _rds_session(request, db)
         school_id = s.get('schoolId')
 
         doc = db.collection('rds_result_files').document(file_id).get()
         if not doc.exists:
             return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
 
-        file_data = doc.to_dict()
+        file_data = _serialize_file(doc)
         if file_data.get('schoolId') != school_id:
             return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
 
-        file_data['id'] = doc.id
-        for f in ('createdAt', 'updatedAt', 'submittedAt', 'approvedAt',
-                  'rejectedAt', 'distributedAt'):
-            if file_data.get(f) and hasattr(file_data[f], 'isoformat'):
-                file_data[f] = file_data[f].isoformat()
-
-        # Fetch entries
-        entries_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        entries_snap = (db.collection('rds_result_entries')
+                          .where('resultFileId', '==', file_id).get())
         entries = []
         for e in entries_snap:
-            row = e.to_dict()
-            row['id'] = e.id
+            row = e.to_dict(); row['id'] = e.id
             for f in ('createdAt', 'updatedAt'):
-                if row.get(f) and hasattr(row[f], 'isoformat'):
-                    row[f] = row[f].isoformat()
+                row[f] = _ts(row.get(f))
             entries.append(row)
 
-        # Sort by student name
         entries.sort(key=lambda e: e.get('studentName', ''))
-
-        # Compute positions
         positions = _compute_positions(entries)
         for entry in entries:
-            entry['position'] = positions.get(entry['id'], '—')
+            entry['position']    = positions.get(entry['id'], '—')
             entry['positionStr'] = _ordinal(entry['position']) if isinstance(entry['position'], int) else '—'
 
         return _rds_json_resp({'ok': True, 'file': file_data, 'entries': entries}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -2145,23 +1877,12 @@ def rds_result_files_get(file_id):
 
 @app.route('/rds-result-files/populate', methods=['POST', 'OPTIONS'])
 def rds_result_files_populate():
-    """
-    Populate a result file with students from rds_students (same classGrade).
-    For CBT students: auto-pull exam score from submissions if cbtExamId is set.
-    For manual students: create blank entries for teacher to fill.
-    Skips students already in this file.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s          = sess.to_dict()
+        s  = _rds_session(request, db)
         school_id  = s.get('schoolId')
         teacher_id = s.get('uid')
 
@@ -2170,7 +1891,6 @@ def rds_result_files_populate():
         if not file_id:
             return _rds_json_resp({'ok': False, 'error': 'fileId required.'}, 400, request)
 
-        # Get result file
         file_doc = db.collection('rds_result_files').document(file_id).get()
         if not file_doc.exists:
             return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
@@ -2180,22 +1900,24 @@ def rds_result_files_populate():
         if fd.get('status') != 'draft':
             return _rds_json_resp({'ok': False, 'error': 'Only draft files can be populated.'}, 400, request)
 
-        class_grade  = fd.get('classGrade', '')
-        cbt_exam_id  = fd.get('cbtExamId', '')
+        class_grade = fd.get('classGrade', '')
+        cbt_exam_id = fd.get('cbtExamId', '')
 
-        # Get students for this class
-        students_snap = db.collection('rds_students')             .where('schoolId',   '==', school_id)             .where('classGrade', '==', class_grade).get()
+        students_snap = (db.collection('rds_students')
+                           .where('schoolId',   '==', school_id)
+                           .where('classGrade', '==', class_grade).get())
 
-        # Get existing entries to skip duplicates
-        existing_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        existing_snap = (db.collection('rds_result_entries')
+                           .where('resultFileId', '==', file_id).get())
         existing_student_ids = {e.to_dict().get('studentId') for e in existing_snap}
 
-        # Load CBT submissions for this exam if linked
         cbt_scores = {}
         if cbt_exam_id:
-            subs_snap = db.collection('submissions')                 .where('examId', '==', cbt_exam_id)                 .where('schoolId', '==', school_id).get()
+            subs_snap = (db.collection('submissions')
+                           .where('examId',   '==', cbt_exam_id)
+                           .where('schoolId', '==', school_id).get())
             for sub in subs_snap:
-                sd = sub.to_dict()
+                sd    = sub.to_dict()
                 email = sd.get('studentEmail', '').lower()
                 if email:
                     cbt_scores[email] = {
@@ -2220,53 +1942,43 @@ def rds_result_files_populate():
             email  = (sd.get('email') or '').lower()
             source = sd.get('source', 'manual')
 
-            # Pull CBT exam score if available
-            cbt_data    = cbt_scores.get(email, {}) if (source == 'cbt' and email) else {}
-            cbt_score   = cbt_data.get('score', None)
-            cbt_total   = cbt_data.get('total', None)
-            cbt_pct     = cbt_data.get('percentage', None)
-
-            # For CBT students: map CBT percentage to exam score out of 60
-            # e.g. 80% CBT score → 48/60 exam score
-            exam_score_from_cbt = None
-            if cbt_pct is not None:
-                exam_score_from_cbt = round((cbt_pct / 100) * 60, 1)
+            cbt_data            = cbt_scores.get(email, {}) if (source == 'cbt' and email) else {}
+            cbt_score           = cbt_data.get('score', None)
+            cbt_total           = cbt_data.get('total', None)
+            cbt_pct             = cbt_data.get('percentage', None)
+            exam_score_from_cbt = round((cbt_pct / 100) * 60, 1) if cbt_pct is not None else None
 
             entry_ref = db.collection('rds_result_entries').document()
             batch.set(entry_ref, {
-                'resultFileId':      file_id,
-                'schoolId':          school_id,
-                'studentId':         student_id,
-                'studentName':       sd.get('name', ''),
-                'classGrade':        class_grade,
-                'source':            source,
-                # CBT data (populated for CBT students)
-                'cbtScore':          cbt_score,
-                'cbtTotal':          cbt_total,
-                'cbtPercentage':     cbt_pct,
-                # Score fields (teacher fills in / pre-filled from CBT)
-                'testScore':         None,
-                'examScore':         exam_score_from_cbt,  # pre-fill from CBT or None
-                'caScore':           None,
-                # Computed (filled when teacher saves scores)
-                'totalScore':        None,
-                'grade':             None,
-                'remark':            None,
-                'position':          None,
-                'createdAt':         datetime.now(timezone.utc),
-                'updatedAt':         datetime.now(timezone.utc),
+                'resultFileId':  file_id,
+                'schoolId':      school_id,
+                'studentId':     student_id,
+                'studentName':   sd.get('name', ''),
+                'classGrade':    class_grade,
+                'source':        source,
+                'cbtScore':      cbt_score,
+                'cbtTotal':      cbt_total,
+                'cbtPercentage': cbt_pct,
+                'testScore':     None,
+                'examScore':     exam_score_from_cbt,
+                'caScore':       None,
+                'totalScore':    None,
+                'grade':         None,
+                'remark':        None,
+                'position':      None,
+                'createdAt':     datetime.now(timezone.utc),
+                'updatedAt':     datetime.now(timezone.utc),
             })
             created += 1
             count   += 1
             if count == 499:
                 batch.commit()
-                batch  = db.batch()
-                count  = 0
+                batch = db.batch()
+                count = 0
 
         if count > 0:
             batch.commit()
 
-        # Update totalStudents on result file
         total_now = len(existing_student_ids) + created
         db.collection('rds_result_files').document(file_id).update({
             'totalStudents': total_now,
@@ -2281,6 +1993,8 @@ def rds_result_files_populate():
             'message': f'{created} student(s) added to result file.',
         }, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -2288,23 +2002,12 @@ def rds_result_files_populate():
 
 @app.route('/rds-result-entries/save', methods=['POST', 'OPTIONS'])
 def rds_result_entries_save():
-    """
-    Save scores for one or more entries.
-    Accepts: { fileId, entries: [{id, testScore, examScore, caScore}, ...] }
-    Auto-computes totalScore, grade, remark.
-    Positions are recomputed across ALL entries for the file.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s         = sess.to_dict()
+        s  = _rds_session(request, db)
         school_id = s.get('schoolId')
 
         body    = request.get_json(force=True, silent=True) or {}
@@ -2314,7 +2017,6 @@ def rds_result_entries_save():
         if not file_id:
             return _rds_json_resp({'ok': False, 'error': 'fileId required.'}, 400, request)
 
-        # Verify file belongs to school and is draft
         file_doc = db.collection('rds_result_files').document(file_id).get()
         if not file_doc.exists:
             return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
@@ -2324,50 +2026,40 @@ def rds_result_entries_save():
         if fd.get('status') not in ('draft',):
             return _rds_json_resp({'ok': False, 'error': 'Only draft files can be edited.'}, 400, request)
 
-        # Save each entry
+        def to_num(v):
+            try:   return float(v) if v is not None and str(v).strip() != '' else None
+            except: return None
+
         batch = db.batch()
         count = 0
 
         for row in entries:
-            entry_id  = (row.get('id') or '').strip()
+            entry_id = (row.get('id') or '').strip()
             if not entry_id: continue
 
-            test_score = row.get('testScore')
-            exam_score = row.get('examScore')
-            ca_score   = row.get('caScore')
+            test  = to_num(row.get('testScore'))
+            exam  = to_num(row.get('examScore'))
+            ca    = to_num(row.get('caScore'))
 
-            # Convert to float, treat empty/None as None
-            def to_num(v):
-                try: return float(v) if v is not None and str(v).strip() != '' else None
-                except: return None
-
-            test  = to_num(test_score)
-            exam  = to_num(exam_score)
-            ca    = to_num(ca_score)
-
-            # Compute total — only if all three are present
-            total = None
-            grade = None
+            total  = None
+            grade  = None
             remark = None
             if test is not None and exam is not None and ca is not None:
                 total  = round(test + exam + ca, 1)
-                max_sc = 130  # 40 + 60 + 30
-                grade  = _compute_grade(total, max_sc)
+                grade  = _compute_grade(total, 130)
                 remark = _compute_remark(grade)
 
-            update = {
-                'testScore': test,
-                'examScore': exam,
-                'caScore':   ca,
-                'totalScore':total,
-                'grade':     grade,
-                'remark':    remark,
-                'updatedAt': datetime.now(timezone.utc),
-            }
             ref = db.collection('rds_result_entries').document(entry_id)
-            batch.update(ref, update)
+            batch.update(ref, {
+                'testScore':  test,
+                'examScore':  exam,
+                'caScore':    ca,
+                'totalScore': total,
+                'grade':      grade,
+                'remark':     remark,
+                'updatedAt':  datetime.now(timezone.utc),
+            })
             count += 1
-
             if count == 499:
                 batch.commit()
                 batch = db.batch()
@@ -2376,12 +2068,12 @@ def rds_result_entries_save():
         if count > 0:
             batch.commit()
 
-        # Recompute positions across ALL entries in this file
-        all_entries_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        # Recompute positions for all entries in this file
+        all_entries_snap = (db.collection('rds_result_entries')
+                              .where('resultFileId', '==', file_id).get())
         all_entries = []
         for e in all_entries_snap:
-            row = e.to_dict()
-            row['id'] = e.id
+            row = e.to_dict(); row['id'] = e.id
             all_entries.append(row)
 
         positions = _compute_positions([e for e in all_entries if e.get('totalScore') is not None])
@@ -2400,7 +2092,6 @@ def rds_result_entries_save():
         if pos_count > 0:
             pos_batch.commit()
 
-        # Update file updatedAt
         db.collection('rds_result_files').document(file_id).update({
             'updatedAt': datetime.now(timezone.utc)
         })
@@ -2408,6 +2099,8 @@ def rds_result_entries_save():
         return _rds_json_resp({'ok': True, 'saved': len(entries),
             'message': 'Scores saved successfully.'}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -2415,23 +2108,13 @@ def rds_result_entries_save():
 
 @app.route('/rds-result-files/submit/<file_id>', methods=['POST', 'OPTIONS'])
 def rds_result_files_submit(file_id):
-    """
-    Teacher submits a result file for coordinator/admin review.
-    Validates all entries have complete scores before allowing submission.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s         = sess.to_dict()
+        s  = _rds_session(request, db)
         school_id = s.get('schoolId')
-        role      = s.get('role')
 
         file_doc = db.collection('rds_result_files').document(file_id).get()
         if not file_doc.exists:
@@ -2442,19 +2125,19 @@ def rds_result_files_submit(file_id):
         if fd.get('status') != 'draft':
             return _rds_json_resp({'ok': False, 'error': 'Only draft files can be submitted.'}, 400, request)
 
-        # Check all entries are complete
-        entries_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        entries_snap = (db.collection('rds_result_entries')
+                          .where('resultFileId', '==', file_id).get())
         entries = [e.to_dict() for e in entries_snap]
 
         if not entries:
             return _rds_json_resp({'ok': False,
                 'error': 'No students in this result file. Please populate it first.'}, 400, request)
 
-        incomplete = [e.get('studentName', '?') for e in entries
-                      if e.get('totalScore') is None]
+        incomplete = [e.get('studentName', '?') for e in entries if e.get('totalScore') is None]
         if incomplete:
+            names = ', '.join(incomplete[:5]) + ('...' if len(incomplete) > 5 else '')
             return _rds_json_resp({'ok': False,
-                'error': f'{len(incomplete)} student(s) have incomplete scores: {", ".join(incomplete[:5])}{"..." if len(incomplete) > 5 else ""}.'}, 400, request)
+                'error': f'{len(incomplete)} student(s) have incomplete scores: {names}.'}, 400, request)
 
         db.collection('rds_result_files').document(file_id).update({
             'status':      'submitted',
@@ -2462,9 +2145,10 @@ def rds_result_files_submit(file_id):
             'updatedAt':   datetime.now(timezone.utc),
         })
 
-        return _rds_json_resp({'ok': True,
-            'message': 'Result file submitted for review.'}, req=request)
+        return _rds_json_resp({'ok': True, 'message': 'Result file submitted for review.'}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -2472,20 +2156,14 @@ def rds_result_files_submit(file_id):
 
 @app.route('/rds-result-files/delete/<file_id>', methods=['POST', 'OPTIONS'])
 def rds_result_files_delete(file_id):
-    """Delete a draft result file and all its entries."""
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
         db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        s         = sess.to_dict()
-        school_id = s.get('schoolId')
+        s  = _rds_session(request, db)
         role      = s.get('role')
+        school_id = s.get('schoolId')
         uid       = s.get('uid')
 
         file_doc = db.collection('rds_result_files').document(file_id).get()
@@ -2499,8 +2177,8 @@ def rds_result_files_delete(file_id):
         if role == 'teacher' and fd.get('teacherId') != uid:
             return _rds_json_resp({'ok': False, 'error': 'You can only delete your own result files.'}, 403, request)
 
-        # Delete all entries first
-        entries_snap = db.collection('rds_result_entries')             .where('resultFileId', '==', file_id).get()
+        entries_snap = (db.collection('rds_result_entries')
+                          .where('resultFileId', '==', file_id).get())
         batch = db.batch()
         count = 0
         for e in entries_snap:
@@ -2513,11 +2191,11 @@ def rds_result_files_delete(file_id):
         if count > 0:
             batch.commit()
 
-        # Delete the file
         db.collection('rds_result_files').document(file_id).delete()
-
         return _rds_json_resp({'ok': True, 'message': 'Result file deleted.'}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         traceback.print_exc()
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
@@ -2525,21 +2203,13 @@ def rds_result_files_delete(file_id):
 
 @app.route('/rds-result-files/cbt-exams', methods=['POST', 'OPTIONS'])
 def rds_cbt_exams_for_class():
-    """
-    Return list of CBT exams for a given classGrade in this school.
-    Used in result file creation — teacher picks which CBT exam to link.
-    """
     request = flask_request
     if request.method == 'OPTIONS':
         return make_response('', 204, _make_rds_cors(request))
     try:
-        session_id = (request.headers.get('Authorization') or '').replace('Session ', '').strip()
-        db = _get_db()
-
-        sess = db.collection('rds_sessions').document(session_id).get()
-        if not sess.exists:
-            return _rds_json_resp({'ok': False, 'error': 'Invalid session'}, 401, request)
-        school_id = sess.to_dict().get('schoolId')
+        db        = _get_db()
+        s         = _rds_session(request, db)
+        school_id = s.get('schoolId')
 
         body        = request.get_json(force=True, silent=True) or {}
         class_grade = (body.get('classGrade') or '').strip()
@@ -2561,20 +2231,403 @@ def rds_cbt_exams_for_class():
                 'subject':     ed.get('subject', ed.get('title', '')),
             })
         exams.sort(key=lambda e: e['title'])
-
         return _rds_json_resp({'ok': True, 'exams': exams}, req=request)
 
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
     except Exception as e:
         return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
 
 
-# ── Health check ──────────────────────────────────────────────────────────────
+# =============================================================================
+# RDS — Phase 3: Coordinator Approval Workflow
+#
+# Status flow:  draft → submitted → approved | rejected → distributed
+#
+# Actors:
+#   teacher       → creates draft, populates, saves scores, submits, recalls
+#   sub_admin     → same as teacher for their own files
+#   school_admin  → coordinator: approves / rejects / requests correction
+#   super_admin   → can do everything
+#
+# Endpoints:
+#   POST /rds-result-files/approve/<file_id>   — coordinator approves
+#   POST /rds-result-files/reject/<file_id>    — coordinator rejects with comment
+#   POST /rds-result-files/recall/<file_id>    — teacher recalls submitted file back to draft
+#   POST /rds-result-files/pending             — coordinator lists all submitted files
+#   POST /rds-result-files/approval-history    — full audit log per file
+# =============================================================================
+
+COORDINATOR_ROLES = ('school_admin', 'super_admin')
+TEACHER_ROLES     = ('teacher', 'sub_admin', 'school_admin', 'super_admin')
+
+
+@app.route('/rds-result-files/approve/<file_id>', methods=['POST', 'OPTIONS'])
+def rds_result_files_approve(file_id):
+    """
+    Coordinator approves a submitted result file.
+    Status: submitted → approved
+    Only school_admin and super_admin can approve.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        db = _get_db()
+        s  = _rds_session(request, db)
+        role      = s.get('role')
+        school_id = s.get('schoolId')
+        uid       = s.get('uid')
+        name      = s.get('name', uid)
+
+        if role not in COORDINATOR_ROLES:
+            return _rds_json_resp({'ok': False,
+                'error': 'Only coordinators (school_admin / super_admin) can approve result files.'}, 403, request)
+
+        file_doc = db.collection('rds_result_files').document(file_id).get()
+        if not file_doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+        fd = file_doc.to_dict()
+
+        # super_admin can approve any school; school_admin only their own
+        if role == 'school_admin' and fd.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised for this school.'}, 403, request)
+
+        if fd.get('status') != 'submitted':
+            return _rds_json_resp({'ok': False,
+                'error': f'Only submitted files can be approved. Current status: {fd.get("status")}.'}, 400, request)
+
+        body    = request.get_json(force=True, silent=True) or {}
+        comment = (body.get('comment') or '').strip()
+
+        db.collection('rds_result_files').document(file_id).update({
+            'status':          'approved',
+            'approvedAt':      datetime.now(timezone.utc),
+            'approvedBy':      uid,
+            'approvedByName':  name,
+            'approvalComment': comment,
+            'updatedAt':       datetime.now(timezone.utc),
+            # Clear any previous rejection data
+            'rejectedAt':      None,
+            'rejectedBy':      None,
+            'rejectedByName':  None,
+            'rejectionComment':None,
+        })
+
+        # Log approval event
+        db.collection('rds_approval_log').add({
+            'fileId':    file_id,
+            'schoolId':  fd.get('schoolId'),
+            'action':    'approved',
+            'actorUid':  uid,
+            'actorName': name,
+            'actorRole': role,
+            'comment':   comment,
+            'timestamp': datetime.now(timezone.utc),
+            'fileMeta': {
+                'subject':    fd.get('subject'),
+                'classGrade': fd.get('classGrade'),
+                'session':    fd.get('session'),
+                'term':       fd.get('term'),
+                'teacherName':fd.get('teacherName'),
+            },
+        })
+
+        return _rds_json_resp({'ok': True,
+            'message': f'Result file approved by {name}.'}, req=request)
+
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/reject/<file_id>', methods=['POST', 'OPTIONS'])
+def rds_result_files_reject(file_id):
+    """
+    Coordinator rejects a submitted result file with a required comment.
+    Status: submitted → rejected
+    Teacher can then recall → fix → resubmit.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        db = _get_db()
+        s  = _rds_session(request, db)
+        role      = s.get('role')
+        school_id = s.get('schoolId')
+        uid       = s.get('uid')
+        name      = s.get('name', uid)
+
+        if role not in COORDINATOR_ROLES:
+            return _rds_json_resp({'ok': False,
+                'error': 'Only coordinators (school_admin / super_admin) can reject result files.'}, 403, request)
+
+        file_doc = db.collection('rds_result_files').document(file_id).get()
+        if not file_doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+        fd = file_doc.to_dict()
+
+        if role == 'school_admin' and fd.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised for this school.'}, 403, request)
+
+        if fd.get('status') != 'submitted':
+            return _rds_json_resp({'ok': False,
+                'error': f'Only submitted files can be rejected. Current status: {fd.get("status")}.'}, 400, request)
+
+        body    = request.get_json(force=True, silent=True) or {}
+        comment = (body.get('comment') or '').strip()
+
+        if not comment:
+            return _rds_json_resp({'ok': False,
+                'error': 'A rejection comment is required so the teacher knows what to fix.'}, 400, request)
+
+        db.collection('rds_result_files').document(file_id).update({
+            'status':          'rejected',
+            'rejectedAt':      datetime.now(timezone.utc),
+            'rejectedBy':      uid,
+            'rejectedByName':  name,
+            'rejectionComment':comment,
+            'updatedAt':       datetime.now(timezone.utc),
+        })
+
+        # Log rejection event
+        db.collection('rds_approval_log').add({
+            'fileId':    file_id,
+            'schoolId':  fd.get('schoolId'),
+            'action':    'rejected',
+            'actorUid':  uid,
+            'actorName': name,
+            'actorRole': role,
+            'comment':   comment,
+            'timestamp': datetime.now(timezone.utc),
+            'fileMeta': {
+                'subject':    fd.get('subject'),
+                'classGrade': fd.get('classGrade'),
+                'session':    fd.get('session'),
+                'term':       fd.get('term'),
+                'teacherName':fd.get('teacherName'),
+            },
+        })
+
+        return _rds_json_resp({'ok': True,
+            'message': f'Result file rejected. Comment sent to teacher.'}, req=request)
+
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/recall/<file_id>', methods=['POST', 'OPTIONS'])
+def rds_result_files_recall(file_id):
+    """
+    Teacher recalls a submitted or rejected file back to draft for editing.
+    Cannot recall an approved file.
+    Status: submitted | rejected → draft
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        db = _get_db()
+        s  = _rds_session(request, db)
+        role      = s.get('role')
+        school_id = s.get('schoolId')
+        uid       = s.get('uid')
+        name      = s.get('name', uid)
+
+        file_doc = db.collection('rds_result_files').document(file_id).get()
+        if not file_doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+        fd = file_doc.to_dict()
+
+        if fd.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+
+        # Teachers can only recall their own files; admins can recall any
+        if role == 'teacher' and fd.get('teacherId') != uid:
+            return _rds_json_resp({'ok': False,
+                'error': 'You can only recall your own result files.'}, 403, request)
+
+        current_status = fd.get('status')
+        if current_status == 'approved':
+            return _rds_json_resp({'ok': False,
+                'error': 'Approved files cannot be recalled. Contact a coordinator.'}, 400, request)
+        if current_status == 'draft':
+            return _rds_json_resp({'ok': False,
+                'error': 'This file is already in draft.'}, 400, request)
+        if current_status == 'distributed':
+            return _rds_json_resp({'ok': False,
+                'error': 'Distributed files cannot be recalled.'}, 400, request)
+
+        db.collection('rds_result_files').document(file_id).update({
+            'status':      'draft',
+            'submittedAt': None,
+            'updatedAt':   datetime.now(timezone.utc),
+        })
+
+        # Log recall event
+        db.collection('rds_approval_log').add({
+            'fileId':    file_id,
+            'schoolId':  fd.get('schoolId'),
+            'action':    'recalled',
+            'actorUid':  uid,
+            'actorName': name,
+            'actorRole': role,
+            'comment':   f'Recalled from {current_status} back to draft.',
+            'timestamp': datetime.now(timezone.utc),
+            'fileMeta': {
+                'subject':    fd.get('subject'),
+                'classGrade': fd.get('classGrade'),
+                'session':    fd.get('session'),
+                'term':       fd.get('term'),
+                'teacherName':fd.get('teacherName'),
+            },
+        })
+
+        return _rds_json_resp({'ok': True,
+            'message': 'Result file recalled to draft. You can now edit and resubmit.'}, req=request)
+
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/pending', methods=['POST', 'OPTIONS'])
+def rds_result_files_pending():
+    """
+    Coordinator view: list all submitted files awaiting approval.
+    Can also filter by status (submitted | approved | rejected | distributed).
+    Only school_admin and super_admin can call this.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        db = _get_db()
+        s  = _rds_session(request, db)
+        role      = s.get('role')
+        school_id = s.get('schoolId')
+
+        if role not in COORDINATOR_ROLES:
+            return _rds_json_resp({'ok': False,
+                'error': 'Only coordinators can view the approval queue.'}, 403, request)
+
+        body   = request.get_json(force=True, silent=True) or {}
+        status = (body.get('status') or 'submitted').strip()
+
+        q = db.collection('rds_result_files').where('schoolId', '==', school_id)
+        if status != 'all':
+            q = q.where('status', '==', status)
+
+        docs  = q.order_by('submittedAt', direction='DESCENDING').get()
+        files = [_serialize_file(d) for d in docs]
+
+        # Enrich with entry count
+        for f in files:
+            count_snap = (db.collection('rds_result_entries')
+                            .where('resultFileId', '==', f['id']).get())
+            f['entryCount'] = len(count_snap)
+
+        return _rds_json_resp({
+            'ok':    True,
+            'files': files,
+            'count': len(files),
+            'status': status,
+        }, req=request)
+
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+@app.route('/rds-result-files/approval-history/<file_id>', methods=['POST', 'OPTIONS'])
+def rds_result_files_approval_history(file_id):
+    """
+    Return full approval audit log for a result file.
+    Available to all RDS roles — teachers can see the history of their own files.
+    """
+    request = flask_request
+    if request.method == 'OPTIONS':
+        return make_response('', 204, _make_rds_cors(request))
+    try:
+        db = _get_db()
+        s  = _rds_session(request, db)
+        school_id = s.get('schoolId')
+        role      = s.get('role')
+        uid       = s.get('uid')
+
+        file_doc = db.collection('rds_result_files').document(file_id).get()
+        if not file_doc.exists:
+            return _rds_json_resp({'ok': False, 'error': 'Result file not found.'}, 404, request)
+        fd = file_doc.to_dict()
+
+        if fd.get('schoolId') != school_id:
+            return _rds_json_resp({'ok': False, 'error': 'Not authorised.'}, 403, request)
+
+        # Teachers can only see history of their own files
+        if role == 'teacher' and fd.get('teacherId') != uid:
+            return _rds_json_resp({'ok': False,
+                'error': 'You can only view the history of your own result files.'}, 403, request)
+
+        log_snap = (db.collection('rds_approval_log')
+                      .where('fileId', '==', file_id)
+                      .order_by('timestamp', direction='DESCENDING')
+                      .get())
+
+        log = []
+        for doc in log_snap:
+            row = doc.to_dict()
+            row['id'] = doc.id
+            row['timestamp'] = _ts(row.get('timestamp'))
+            log.append(row)
+
+        return _rds_json_resp({
+            'ok':     True,
+            'fileId': file_id,
+            'file':   _serialize_file(file_doc),
+            'log':    log,
+        }, req=request)
+
+    except PermissionError as e:
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 401, request)
+    except Exception as e:
+        traceback.print_exc()
+        return _rds_json_resp({'ok': False, 'error': str(e)}, 500, request)
+
+
+# =============================================================================
+# HEALTH CHECK
+# =============================================================================
+
 @app.route('/health', methods=['GET'])
 def health():
-    return make_response('{"ok":true}', 200, {'Content-Type':'application/json'})
+    return make_response('{"ok":true}', 200, {'Content-Type': 'application/json'})
 
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
+# =============================================================================
+# STARTUP — initialise Firebase Admin eagerly so errors surface immediately
+# =============================================================================
+
+try:
+    _get_db()
+    print('[STARTUP] Firebase Admin initialized successfully')
+except Exception as _e:
+    print('[STARTUP] WARNING: Firebase Admin init failed:', _e)
+
+
+# =============================================================================
+# ENTRYPOINT
+# =============================================================================
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
