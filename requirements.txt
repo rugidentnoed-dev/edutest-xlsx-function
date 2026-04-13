@@ -2,3 +2,5 @@ openpyxl==3.*
 Flask==3.*
 firebase-admin==6.*
 gunicorn==21.*
+reportlab==4.*
+requests==2.*
